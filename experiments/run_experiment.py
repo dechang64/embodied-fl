@@ -1,785 +1,867 @@
 """
-Embodied-FL Experiment Framework v3
+Embodied-FL Experiment Framework v5
 =====================================
-Key insight: All clients share the SAME task (same output_dim) but have
-different data distributions (Non-IID). This is the standard FL setting
-where task-aware aggregation should shine.
+6 experiments, pure NumPy, Adam optimizer, cosine LR.
 
-Scenario: 5 factories all doing PCB defect classification (10 classes)
-but with different defect distributions (Non-IID label skew).
+Exp1: FedAvg vs FedProx vs Ours (5 clients, Non-IID)
+Exp2: Scalability (10 clients)
+Exp3: Non-IID severity sweep
+Exp4: Heterogeneous tasks (shared backbone)
+Exp5: Continual learning (EWC + Replay vs Fine-tune)
+Exp6: Gradient compression (Top-K + Quantization)
 """
 
 import numpy as np
-import json
-import os
-import time
-from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional
+import json, os, time
+from dataclasses import dataclass
+from typing import List, Dict, Tuple
 from copy import deepcopy
 
 
-# ============================================================
-# Neural Network (pure NumPy)
-# ============================================================
+# ═══════════════════════════════════════════════════════════════
+#  MLP with Adam
+# ═══════════════════════════════════════════════════════════════
 
 class MLP:
-    """Multi-layer perceptron with ReLU + softmax output."""
-
-    def __init__(self, layer_sizes: List[int], seed: int = 42):
+    def __init__(self, sizes: List[int], seed=42, use_adam=True):
         self.rng = np.random.RandomState(seed)
-        self.layer_sizes = layer_sizes
-        self.weights = []
-        self.biases = []
-        self._activations = []
-        self._pre_acts = []
-        for i in range(len(layer_sizes) - 1):
-            fan_in, fan_out = layer_sizes[i], layer_sizes[i + 1]
-            std = np.sqrt(2.0 / fan_in)
-            self.weights.append(self.rng.randn(fan_in, fan_out).astype(np.float32) * std)
-            self.biases.append(np.zeros(fan_out, dtype=np.float32))
+        self.sizes = sizes
+        self.use_adam = use_adam
+        self._t = 0
+        self.W, self.b = [], []
+        for i in range(len(sizes) - 1):
+            s = np.sqrt(2.0 / sizes[i])
+            self.W.append((self.rng.randn(sizes[i], sizes[i+1]) * s).astype(np.float32))
+            self.b.append(np.zeros(sizes[i+1], dtype=np.float32))
+        if use_adam:
+            self._mw = [np.zeros_like(w) for w in self.W]
+            self._vw = [np.zeros_like(w) for w in self.W]
+            self._mb = [np.zeros_like(b) for b in self.b]
+            self._vb = [np.zeros_like(b) for b in self.b]
+        self._acts = []
+        self._pre = []
 
-    def forward(self, x: np.ndarray) -> np.ndarray:
-        self._activations = [x]
-        self._pre_acts = []
+    def forward(self, x):
+        self._acts = [x]
+        self._pre = []
         a = x
-        for i in range(len(self.weights) - 1):
-            z = a @ self.weights[i] + self.biases[i]
-            self._pre_acts.append(z)
+        for i in range(len(self.W) - 1):
+            z = a @ self.W[i] + self.b[i]
+            self._pre.append(z)
             a = np.maximum(0, z)
-            self._activations.append(a)
-        z = a @ self.weights[-1] + self.biases[-1]
-        self._pre_acts.append(z)
-        # Softmax
-        z_shifted = z - np.max(z, axis=1, keepdims=True)
-        exp_z = np.exp(z_shifted)
-        probs = exp_z / np.sum(exp_z, axis=1, keepdims=True)
-        self._activations.append(probs)
-        return probs
+            self._acts.append(a)
+        z = a @ self.W[-1] + self.b[-1]
+        self._pre.append(z)
+        e = np.exp(z - z.max(axis=1, keepdims=True))
+        p = e / e.sum(axis=1, keepdims=True)
+        self._acts.append(p)
+        return p
 
-    def backward(self, x: np.ndarray, y: np.ndarray, lr: float = 0.01) -> float:
+    def _adam(self, param, grad, m, v, lr):
+        self._t += 1
+        m[:] = 0.9 * m + 0.1 * grad
+        v[:] = 0.999 * v + 0.001 * grad**2
+        mh = m / (1 - 0.9**self._t)
+        vh = v / (1 - 0.999**self._t)
+        param -= lr * mh / (np.sqrt(vh) + 1e-8)
+
+    def train_step(self, x, y, lr=0.001):
+        """Forward + backward + update. Returns loss."""
         m = x.shape[0]
-        probs = self.forward(x)
-        # Cross-entropy loss
-        loss = -np.sum(y * np.log(probs + 1e-8)) / m
-        # Gradient of softmax + cross-entropy
-        delta = (probs - y) / m
-        for i in range(len(self.weights) - 1, -1, -1):
-            dw = self._activations[i].T @ delta
-            db = np.sum(delta, axis=0)
+        p = self.forward(x)
+        loss = -np.sum(y * np.log(p + 1e-8)) / m
+        d = (p - y) / m
+        for i in range(len(self.W) - 1, -1, -1):
+            dw = self._acts[i].T @ d
+            db = d.sum(axis=0)
             if i > 0:
-                delta = (delta @ self.weights[i].T) * (self._pre_acts[i - 1] > 0).astype(np.float32)
-            self.weights[i] -= lr * dw
-            self.biases[i] -= lr * db
-        return loss
+                d = (d @ self.W[i].T) * (self._pre[i-1] > 0)
+            if self.use_adam:
+                self._adam(self.W[i], dw, self._mw[i], self._vw[i], lr)
+                self._adam(self.b[i], db, self._mb[i], self._vb[i], lr)
+            else:
+                self.W[i] -= lr * dw
+                self.b[i] -= lr * db
+        return float(loss)
 
-    def get_params(self) -> List[np.ndarray]:
-        params = []
-        for w, b in zip(self.weights, self.biases):
-            params.append(w.copy())
-            params.append(b.copy())
-        return params
+    def compute_grad(self, x, y):
+        """Compute gradients WITHOUT updating weights. Returns [dw0,db0,dw1,db1,...]."""
+        m = x.shape[0]
+        p = self.forward(x)
+        d = (p - y) / m
+        raw = []
+        for i in range(len(self.W) - 1, -1, -1):
+            dw = self._acts[i].T @ d
+            db = d.sum(axis=0)
+            raw.append((dw, db))
+            if i > 0:
+                d = (d @ self.W[i].T) * (self._pre[i-1] > 0)
+        grads = []
+        for dw, db in reversed(raw):
+            grads.append(dw)
+            grads.append(db)
+        return grads
 
-    def set_params(self, params: List[np.ndarray]):
-        for i in range(len(self.weights)):
-            self.weights[i] = params[2 * i].copy()
-            self.biases[i] = params[2 * i + 1].copy()
+    def apply_grad(self, grads, lr=0.001):
+        """Manually apply gradients (for compression experiments)."""
+        for i in range(len(self.W)):
+            if self.use_adam:
+                self._adam(self.W[i], grads[2*i], self._mw[i], self._vw[i], lr)
+                self._adam(self.b[i], grads[2*i+1], self._mb[i], self._vb[i], lr)
+            else:
+                self.W[i] -= lr * grads[2*i]
+                self.b[i] -= lr * grads[2*i+1]
 
-    def param_count(self) -> int:
-        return sum(w.size + b.size for w, b in zip(self.weights, self.biases))
+    def accuracy(self, x, y):
+        p = self.forward(x)
+        return float(np.mean(np.argmax(p, axis=1) == np.argmax(y, axis=1)))
 
-    def accuracy(self, x: np.ndarray, y: np.ndarray) -> float:
-        probs = self.forward(x)
-        return float(np.mean(np.argmax(probs, axis=1) == np.argmax(y, axis=1)))
+    def get_params(self):
+        r = []
+        for w, b in zip(self.W, self.b):
+            r.append(w.copy())
+            r.append(b.copy())
+        return r
 
+    def set_params(self, params):
+        for i in range(len(self.W)):
+            self.W[i] = params[2*i].copy()
+            self.b[i] = params[2*i+1].copy()
 
-# ============================================================
-# Data Generation: Non-IID Label Skew (Dirichlet)
-# ============================================================
-
-def generate_non_iid_data(n_samples: int, n_classes: int, alpha: float,
-                          input_dim: int, seed: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Generate Non-IID data with Dirichlet label distribution.
-    
-    alpha controls Non-IID severity:
-      alpha → ∞: uniform (IID)
-      alpha → 0: extreme Non-IID (each client has few classes)
-    """
-    rng = np.random.RandomState(seed)
-
-    # Sample label distribution from Dirichlet
-    label_dist = rng.dirichlet(np.ones(n_classes) * alpha)
-    labels = rng.choice(n_classes, size=n_samples, p=label_dist)
-
-    # Generate features: class-conditional Gaussians
-    X = np.zeros((n_samples, input_dim), dtype=np.float32)
-    # Shared basis (backbone should learn this)
-    W_shared = rng.randn(input_dim, 16).astype(np.float32) * 0.5
-    for c in range(n_classes):
-        mask = labels == c
-        n_c = mask.sum()
-        if n_c == 0:
-            continue
-        # Class-specific latent
-        latent = rng.randn(n_c, 16).astype(np.float32) + rng.randn(1, 16) * 1.5
-        X[mask] = latent @ W_shared.T + rng.randn(n_c, input_dim) * 0.3
-
-    # One-hot labels
-    y = np.zeros((n_samples, n_classes), dtype=np.float32)
-    y[np.arange(n_samples), labels] = 1.0
-
-    return X, y, label_dist
+    def param_count(self):
+        return sum(w.size + b.size for w, b in zip(self.W, self.b))
 
 
-# ============================================================
-# Federated Aggregation
-# ============================================================
+# ═══════════════════════════════════════════════════════════════
+#  Utilities
+# ═══════════════════════════════════════════════════════════════
 
-def aggregate_fedavg(updates: List[Dict], client_weights: List[float]) -> List[np.ndarray]:
-    total = sum(client_weights)
-    aggregated = []
-    for j in range(len(updates[0]["params"])):
-        param = sum(w * u["params"][j] for w, u in zip(client_weights, updates))
-        aggregated.append(param / total)
-    return aggregated
+def cosine_lr(lr0, step, total, warmup=5):
+    if step < warmup:
+        return lr0 * (step + 1) / warmup
+    p = (step - warmup) / max(total - warmup, 1)
+    return lr0 * 0.5 * (1 + np.cos(np.pi * p))
 
-
-def aggregate_fedprox(updates: List[Dict], client_weights: List[float]) -> List[np.ndarray]:
-    # Same aggregation as FedAvg (proximal term applied client-side)
-    return aggregate_fedavg(updates, client_weights)
-
-
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+def cosine_sim(a, b):
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
 
+def generate_non_iid(n_samples, n_classes, alpha, dim, seed=42):
+    """Dirichlet Non-IID split."""
+    rng = np.random.RandomState(seed)
+    proportions = rng.dirichlet([alpha] * n_classes)
+    proportions = proportions / proportions.sum()
+    counts = (proportions * n_samples).astype(int)
+    counts[-1] = n_samples - counts[:-1].sum()
 
-def aggregate_task_aware(updates: List[Dict], client_weights: List[float],
-                         task_embeddings: List[np.ndarray],
-                         global_embedding: np.ndarray,
-                         alpha: float = 0.3, beta: float = 0.7) -> Tuple[List[np.ndarray], Dict]:
-    """Task-Aware Aggregation: weight by task similarity + sample count."""
-    total_samples = sum(client_weights)
-    similarities = []
-    for emb in task_embeddings:
-        sim = cosine_similarity(emb, global_embedding)
-        similarities.append(max(0.05, sim))
-
-    combined = []
-    for i, (nw, sim) in enumerate(zip(client_weights, similarities)):
-        w = alpha * (nw / total_samples) + beta * sim
-        combined.append(w)
-
-    total_w = sum(combined)
-    combined = [w / total_w for w in combined]
-
-    aggregated = []
-    for j in range(len(updates[0]["params"])):
-        param = sum(w * u["params"][j] for w, u in zip(combined, updates))
-        aggregated.append(param)
-
-    return aggregated, {"weights": combined, "similarities": similarities}
+    X, y = [], []
+    W_latent = rng.randn(dim, 16).astype(np.float32) * 0.5
+    for c in range(n_classes):
+        nc = counts[c]
+        latent = rng.randn(nc, 16).astype(np.float32) + rng.randn(1, 16) * 1.5
+        X.append(latent @ W_latent.T + rng.randn(nc, dim) * 0.3)
+        yc = np.zeros((nc, n_classes), dtype=np.float32)
+        yc[:, c] = 1.0
+        y.append(yc)
+    return np.vstack(X).astype(np.float32), np.vstack(y), proportions
 
 
-# ============================================================
-# Experiment Data Structures
-# ============================================================
+# ═══════════════════════════════════════════════════════════════
+#  Federated Aggregation
+# ═══════════════════════════════════════════════════════════════
+
+def agg_fedavg(updates, weights):
+    total = sum(weights)
+    return [sum(w / total * u[i] for u, w in zip(updates, weights)) for i in range(len(updates[0]))]
+
+def agg_fedprox(updates, weights):
+    return agg_fedavg(updates, weights)
+
+def agg_ours(updates, weights, losses, task_embs, global_emb, temperature=0.5):
+    """Task-Aware Aggregation for Embodied FL.
+
+    Three signals blended:
+      1. Performance rank (40%): clients with lower loss contribute more
+      2. Data volume (30%): standard FL fairness
+      3. Task similarity (30%): cosine sim to global task embedding
+
+    Motivation: In embodied settings, some robots operate in easier environments
+    (clean factory floor) while others face harder conditions (variable lighting).
+    Performance weighting ensures reliable clients dominate aggregation.
+    """
+    n = len(updates)
+
+    # 1. Rank-based performance weight
+    loss_arr = np.array(losses)
+    ranks = np.argsort(np.argsort(loss_arr))  # 0 = best (lowest loss)
+    perf_w = 1.0 + (n - 1 - ranks) / max(n - 1, 1)  # best=2.0, worst=1.0
+    perf_w = perf_w / perf_w.sum()
+
+    # 2. Sample-count weight
+    total_n = sum(weights)
+    sample_w = np.array([w / total_n for w in weights])
+
+    # 3. Similarity weight
+    sims = np.array([cosine_sim(e, global_emb) for e in task_embs])
+    sim_w = np.exp(sims / temperature)
+    sim_w = sim_w / sim_w.sum()
+
+    # Blend
+    combined = 0.4 * perf_w + 0.3 * sample_w + 0.3 * sim_w
+    combined = combined / combined.sum()
+
+    return [sum(combined[i] * updates[i][j] for i in range(n)) for j in range(len(updates[0]))]
+
+
+# ═══════════════════════════════════════════════════════════════
+#  EWC + Replay Buffer
+# ═══════════════════════════════════════════════════════════════
+
+class EWC:
+    def __init__(self, model, lam=10.0):
+        self.model = model
+        self.lam = lam
+        self.fisher = None
+        self.star_params = None
+
+    def consolidate(self, X, y, n_samples=200):
+        """Compute Fisher + store optimal params after a task."""
+        model = self.model
+        idx = np.random.choice(X.shape[0], min(n_samples, X.shape[0]), replace=False)
+        Xs, ys = X[idx], y[idx]
+
+        self.fisher = []
+        for w, b in zip(model.W, model.b):
+            self.fisher.append(np.zeros_like(w))
+            self.fisher.append(np.zeros_like(b))
+
+        for i in range(Xs.shape[0]):
+            p = model.forward(Xs[i:i+1])
+            d = p - ys[i:i+1]
+            for j in range(len(model.W) - 1, -1, -1):
+                dw = model._acts[j].T @ d
+                db = d.sum(axis=0)
+                if j > 0:
+                    d = (d @ model.W[j].T) * (model._pre[j-1] > 0)
+                self.fisher[2*j] += dw**2
+                self.fisher[2*j+1] += db**2
+        for k in range(len(self.fisher)):
+            self.fisher[k] /= Xs.shape[0]
+        self.star_params = model.get_params()
+
+    def penalty(self):
+        """EWC regularization loss."""
+        if self.fisher is None:
+            return 0.0
+        cur = self.model.get_params()
+        return self.lam * sum(np.sum(f * (c - s)**2) for f, c, s in zip(self.fisher, cur, self.star_params))
+
+    def grad_penalty(self, lr):
+        """Apply EWC gradient penalty (clipped for stability)."""
+        if self.fisher is None:
+            return
+        for i in range(len(self.model.W)):
+            dw = self.lam * self.fisher[2*i] * (self.model.W[i] - self.star_params[2*i])
+            db = self.lam * self.fisher[2*i+1] * (self.model.b[i] - self.star_params[2*i+1])
+            dw = np.clip(dw, -0.5, 0.5)
+            db = np.clip(db, -0.5, 0.5)
+            self.model.W[i] -= lr * dw
+            self.model.b[i] -= lr * db
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Gradient Compression
+# ═══════════════════════════════════════════════════════════════
+
+def topk_sparsify(grads, sparsity=0.9):
+    """Top-K sparsification: keep top (1-sparsity) values by magnitude."""
+    sparse = []
+    total_p, nonzero_p = 0, 0
+    for g in grads:
+        flat = g.flatten()
+        total_p += len(flat)
+        k = max(1, int(len(flat) * (1 - sparsity)))
+        thr = np.partition(np.abs(flat), -k)[-k]
+        mask = np.abs(flat) >= thr
+        sg = np.where(mask, flat, 0.0).reshape(g.shape).astype(np.float32)
+        sparse.append(sg)
+        nonzero_p += np.count_nonzero(sg)
+    ratio = total_p / max(nonzero_p, 1)
+    return sparse, {"sparsity": sparsity, "ratio": ratio, "nonzero": nonzero_p, "total": total_p}
+
+def quantize_grads(grads, bits=8):
+    """Min-max uniform quantization."""
+    quant = []
+    for g in grads:
+        gmin, gmax = g.min(), g.max()
+        scale = (gmax - gmin) / (2**bits - 1) if gmax > gmin else 1.0
+        q = np.round((g - gmin) / scale).astype(np.uint8 if bits <= 8 else np.uint16)
+        dq = (q.astype(np.float32) * scale + gmin).reshape(g.shape)
+        quant.append(dq)
+    bpv = max(1, bits // 8)
+    orig = sum(g.nbytes for g in grads)
+    comp = sum(g.size * bpv for g in grads)
+    return quant, {"bits": bits, "ratio": orig / max(comp, 1), "bytes": comp}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Experiment Runner
+# ═══════════════════════════════════════════════════════════════
 
 @dataclass
 class ClientData:
-    client_id: str
+    id: str
     X: np.ndarray
     y: np.ndarray
     label_dist: np.ndarray
-    n_samples: int
-    task_embedding: np.ndarray
-    factory_type: str  # "similar" or "dissimilar" to global need
-
+    n: int
+    task_emb: np.ndarray
+    domain: str
 
 @dataclass
 class RoundResult:
     round_num: int
     global_loss: float
     global_accuracy: float
-    per_client: List[Dict]
-    communication_bytes: float
-    wall_time: float
-    aggregation_weights: Optional[List[float]] = None
+    per_client: list
 
 
-# ============================================================
-# Experiment Runner
-# ============================================================
-
-def run_experiment(clients: List[ClientData], method: str, n_rounds: int,
-                   global_embedding: np.ndarray, model_arch: List[int],
-                   local_epochs: int = 5, lr: float = 0.01,
-                   mu: float = 0.01) -> List[RoundResult]:
-    """Run a federated learning experiment."""
-    n_classes = model_arch[-1]
+def run_fl(clients, method, n_rounds, global_emb, arch,
+           local_epochs=5, lr=0.001, mu=0.01):
+    """Run federated learning experiment."""
     results = []
-
-    # Initialize global model
-    global_model = MLP(model_arch, seed=42)
-    global_params = global_model.get_params()
-    param_bytes = sum(p.nbytes for p in global_params)
+    gm = MLP(arch, seed=42)
+    gp = gm.get_params()
 
     for rnd in range(1, n_rounds + 1):
         t0 = time.time()
-        updates = []
-        client_weights = []
-        task_embeddings = []
+        lr_now = cosine_lr(lr, rnd, n_rounds)
+        updates, cw, losses, tembs = [], [], [], []
 
-        for client in clients:
-            # Local model starts from global
-            local_model = MLP(model_arch, seed=42)
-            local_model.set_params([p.copy() for p in global_params])
-
-            # Local training with multiple epochs
+        for c in clients:
+            lm = MLP(arch, seed=42)
+            lm.set_params([p.copy() for p in gp])
             for _ in range(local_epochs):
-                # Mini-batch
-                idx = np.random.permutation(client.n_samples)
-                X_batch = client.X[idx]
-                y_batch = client.y[idx]
-                loss = local_model.backward(X_batch, y_batch, lr=lr)
-
-                # FedProx: add proximal regularization
+                idx = np.random.permutation(c.n)
+                loss = lm.train_step(c.X[idx], c.y[idx], lr=lr_now)
                 if method == "FedProx":
-                    for i in range(len(local_model.weights)):
-                        local_model.weights[i] -= lr * mu * (local_model.weights[i] - global_params[2 * i])
-                        local_model.biases[i] -= lr * mu * (local_model.biases[i] - global_params[2 * i + 1])
+                    for i in range(len(lm.W)):
+                        lm.W[i] -= lr_now * mu * (lm.W[i] - gp[2*i])
+                        lm.b[i] -= lr_now * mu * (lm.b[i] - gp[2*i+1])
+            updates.append(lm.get_params())
+            cw.append(c.n)
+            losses.append(loss)
+            tembs.append(c.task_emb)
 
-            # Evaluate locally
-            local_acc = local_model.accuracy(client.X, client.y)
-
-            updates.append({"params": local_model.get_params(), "loss": loss, "accuracy": local_acc})
-            client_weights.append(client.n_samples)
-            task_embeddings.append(client.task_embedding)
-
-        # Aggregate
         if method == "Ours":
-            new_params, agg_info = aggregate_task_aware(
-                updates, client_weights, task_embeddings, global_embedding)
-            agg_weights = agg_info["weights"]
+            gp = agg_ours(updates, cw, losses, tembs, global_emb)
         elif method == "FedProx":
-            new_params = aggregate_fedprox(updates, client_weights)
-            agg_weights = None
+            gp = agg_fedprox(updates, cw)
         else:
-            new_params = aggregate_fedavg(updates, client_weights)
-            agg_weights = None
+            gp = agg_fedavg(updates, cw)
 
-        global_params = new_params
-
-        # Evaluate global model on all clients
-        global_model.set_params(global_params)
-        total_loss, total_acc, per_client = 0.0, 0.0, []
-        for client in clients:
-            probs = global_model.forward(client.X)
-            loss = -np.sum(client.y * np.log(probs + 1e-8)) / client.n_samples
-            acc = float(np.mean(np.argmax(probs, axis=1) == np.argmax(client.y, axis=1)))
-            total_loss += loss
-            total_acc += acc
-            per_client.append({"id": client.client_id, "loss": float(loss), "accuracy": float(acc)})
-
-        n_clients = len(clients)
-        wall_time = time.time() - t0
-        results.append(RoundResult(
-            round_num=rnd,
-            global_loss=total_loss / n_clients,
-            global_accuracy=total_acc / n_clients,
-            per_client=per_client,
-            communication_bytes=param_bytes * n_clients / 1024,
-            wall_time=wall_time,
-            aggregation_weights=agg_weights,
-        ))
-
+        gm.set_params(gp)
+        tl, ta, pc = 0.0, 0.0, []
+        for c in clients:
+            p = gm.forward(c.X)
+            l = -np.sum(c.y * np.log(p + 1e-8)) / c.n
+            a = float(np.mean(np.argmax(p, 1) == np.argmax(c.y, 1)))
+            tl += l; ta += a
+            pc.append({"id": c.id, "loss": float(l), "accuracy": float(a)})
+        nc = len(clients)
+        results.append(RoundResult(rnd, tl/nc, ta/nc, pc))
         if rnd % 10 == 0 or rnd == 1:
-            print(f"    R{rnd:3d} | loss={results[-1].global_loss:.4f} | acc={results[-1].global_accuracy:.4f} | "
-                  f"clients={n_clients} | {wall_time:.2f}s")
-
+            print(f"    R{rnd:3d} | loss={tl/nc:.4f} | acc={ta/nc:.4f} | {time.time()-t0:.2f}s")
     return results
 
 
-# ============================================================
-# Main
-# ============================================================
+def make_clients(n_clients, n_classes, alpha, dim, seed=42):
+    """Create Non-IID clients."""
+    rng = np.random.RandomState(seed)
+    names = ["Suzhou", "Wuxi", "Kunshan", "Shenzhen", "Dongguan",
+             "Hangzhou", "Nanjing", "Shanghai", "Chengdu", "Wuhan"]
+    domains = ["PCB", "PCB", "PCB", "PCB", "PCB",
+               "PCB", "PCB", "PCB", "PCB", "PCB"]
+    clients = []
+    for i in range(n_clients):
+        n = rng.randint(300, 700)
+        X, y, ld = generate_non_iid(n, n_classes, alpha, dim, seed + i)
+        emb = rng.randn(32).astype(np.float32) * 0.1
+        clients.append(ClientData(
+            f"Factory-{chr(65+i)}", X, y, ld, n, emb,
+            f"{domains[i] if i < len(domains) else 'PCB'}/{names[i] if i < len(names) else f'City-{i}'}"
+        ))
+    return clients
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Main
+# ═══════════════════════════════════════════════════════════════
 
 def main():
     print("=" * 70)
-    print("  Embodied-FL: Baseline Comparison Experiments v3")
+    print("  Embodied-FL: Baseline Comparison Experiments v5")
     print("  FedAvg vs FedProx vs Ours (Task-Aware Aggregation)")
-    print("  Task: PCB Defect Classification (10 classes, Non-IID)")
+    print("  Optimizer: Adam | LR: Cosine decay | Model: 24→128→64→10")
     print("=" * 70)
 
-    # Config
-    INPUT_DIM = 24
-    HIDDEN = 64
-    N_CLASSES = 10
-    MODEL_ARCH = [INPUT_DIM, HIDDEN, 32, N_CLASSES]
-    N_ROUNDS = 50
-    LOCAL_EPOCHS = 5
-    LR = 0.01
+    # ── Config ──
+    DIM = 24
+    HID = 128
+    NCLS = 10
+    ARCH = [DIM, HID, 64, NCLS]
+    ROUNDS = 80
+    EPOCHS = 5
+    LR = 0.001
 
-    # Global task embedding: represents what the federation "needs"
-    # In our scenario: the federation needs a model good at ALL defect types
-    # We set higher weight on rare defects (classes 7,8,9) that few clients have
-    global_embedding = np.zeros(32, dtype=np.float32)
-    global_embedding[0:10] = np.array([0.3, 0.3, 0.3, 0.3, 0.3,  # common defects
-                                        0.5, 0.5, 0.8, 0.8, 0.8])  # rare defects (high need)
+    # Global task embedding
+    rng = np.random.RandomState(0)
+    global_emb = np.ones(32, dtype=np.float32)
+    global_emb[:10] = 2.0  # emphasize rare classes
 
-    # ============================================================
-    # Experiment 1: 5 Factories, Non-IID Label Skew
-    # ============================================================
+    # ═══════════════════════════════════════════════════════════
+    # Exp1: 5 Factories, Non-IID α=0.5
+    # ═══════════════════════════════════════════════════════════
     print("\n" + "─" * 70)
-    print("  Experiment 1: 5 Factories, Non-IID Label Skew (α=0.5)")
+    print("  Exp1: 5 Factories, Non-IID (α=0.5)")
     print("─" * 70)
+    clients5 = make_clients(5, NCLS, 0.5, DIM, 42)
+    for c in clients5:
+        dom = int(np.argmax(c.label_dist))
+        print(f"  {c.id:12s} | n={c.n:4d} | dominant={dom} ({c.label_dist[dom]:.0%})")
 
-    exp1_configs = [
-        {"id": "Factory-A (Suzhou)",   "n": 500, "alpha": 0.5, "seed": 42,
-         "desc": "Electronics SMT line"},
-        {"id": "Factory-B (Wuxi)",     "n": 400, "alpha": 0.3, "seed": 123,
-         "desc": "Automotive PCB line"},
-        {"id": "Factory-C (Kunshan)",  "n": 600, "alpha": 0.8, "seed": 456,
-         "desc": "3C assembly line"},
-        {"id": "Factory-D (Shenzhen)", "n": 450, "alpha": 0.2, "seed": 789,
-         "desc": "Semiconductor fab"},
-        {"id": "Factory-E (Dongguan)", "n": 380, "alpha": 0.4, "seed": 321,
-         "desc": "Logistics sorting"},
-    ]
-
-    # Create clients
-    def create_clients(configs):
-        clients = []
-        for cfg in configs:
-            X, y, label_dist = generate_non_iid_data(
-                cfg["n"], N_CLASSES, cfg["alpha"], INPUT_DIM, cfg["seed"])
-            # Task embedding: based on label distribution
-            task_emb = np.zeros(32, dtype=np.float32)
-            task_emb[0:N_CLASSES] = label_dist.astype(np.float32)
-            task_emb[16] = cfg["n"] / 1000.0
-            task_emb[17] = cfg["alpha"]
-            # Add some noise
-            rng = np.random.RandomState(cfg["seed"] + 999)
-            task_emb[20:] = rng.randn(12).astype(np.float32) * 0.05
-            clients.append(ClientData(
-                client_id=cfg["id"], X=X, y=y, label_dist=label_dist,
-                n_samples=cfg["n"], task_embedding=task_emb,
-                factory_type=cfg.get("desc", "")
-            ))
-        return clients
-
-    clients = create_clients(exp1_configs)
-    for c in clients:
-        dominant = np.argmax(c.label_dist)
-        print(f"  {c.client_id:25s} | n={c.n_samples:4d} | α={exp1_configs[clients.index(c)]['alpha']:.1f} | "
-              f"dominant class={dominant} ({c.label_dist[dominant]:.1%})")
-
-    all_results = {}
+    exp1 = {}
     for method in ["FedAvg", "FedProx", "Ours"]:
         print(f"\n  Running {method}...")
-        fresh = create_clients(exp1_configs)
-        results = run_experiment(fresh, method, N_ROUNDS, global_embedding,
-                                MODEL_ARCH, LOCAL_EPOCHS, LR)
-        all_results[method] = results
-        print(f"    Final: loss={results[-1].global_loss:.4f}, acc={results[-1].global_accuracy:.4f}")
+        r = run_fl(clients5, method, ROUNDS, global_emb, ARCH, EPOCHS, LR)
+        exp1[method] = r
+        print(f"  Final: loss={r[-1].global_loss:.4f}, acc={r[-1].global_accuracy:.4f}")
 
-    # ============================================================
-    # Experiment 2: Scalability (10 clients)
-    # ============================================================
+    # ═══════════════════════════════════════════════════════════
+    # Exp2: 10 Factories (Scalability)
+    # ═══════════════════════════════════════════════════════════
     print("\n" + "─" * 70)
-    print("  Experiment 2: 10 Factories (Scalability)")
+    print("  Exp2: 10 Factories (Scalability)")
     print("─" * 70)
-
-    exp2_configs = []
-    cities = ["Suzhou", "Wuxi", "Kunshan", "Shenzhen", "Dongguan",
-              "Nanjing", "Hangzhou", "Shanghai", "Chengdu", "Wuhan"]
-    for i, city in enumerate(cities):
-        exp2_configs.append({
-            "id": f"Factory-{chr(65+i)} ({city})",
-            "n": 300 + (i * 37) % 200,
-            "alpha": 0.2 + (i * 0.13),
-            "seed": 42 + i * 100,
-            "desc": f"Plant {i+1}"
-        })
-
-    exp2_results = {}
+    clients10 = make_clients(10, NCLS, 0.5, DIM, 42)
+    exp2 = {}
     for method in ["FedAvg", "Ours"]:
         print(f"\n  Running {method}...")
-        fresh = create_clients(exp2_configs)
-        results = run_experiment(fresh, method, N_ROUNDS, global_embedding,
-                                MODEL_ARCH, LOCAL_EPOCHS, LR)
-        exp2_results[method] = results
-        print(f"    Final: loss={results[-1].global_loss:.4f}, acc={results[-1].global_accuracy:.4f}")
+        r = run_fl(clients10, method, ROUNDS, global_emb, ARCH, EPOCHS, LR)
+        exp2[method] = r
+        print(f"  Final: loss={r[-1].global_loss:.4f}, acc={r[-1].global_accuracy:.4f}")
 
-    # ============================================================
-    # Experiment 3: Non-IID Severity
-    # ============================================================
+    # ═══════════════════════════════════════════════════════════
+    # Exp3: Non-IID Severity
+    # ═══════════════════════════════════════════════════════════
     print("\n" + "─" * 70)
-    print("  Experiment 3: Non-IID Severity (α varies)")
+    print("  Exp3: Non-IID Severity Sweep")
     print("─" * 70)
-
-    base_configs = [
-        {"id": "C1", "n": 500, "alpha": 1.0, "seed": 42},
-        {"id": "C2", "n": 400, "alpha": 1.0, "seed": 123},
-        {"id": "C3", "n": 600, "alpha": 1.0, "seed": 456},
-    ]
-
-    exp3_results = {}
-    for severity, alpha_val in [("IID (α=5.0)", 5.0), ("Low (α=1.0)", 1.0),
-                                 ("Medium (α=0.5)", 0.5), ("High (α=0.1)", 0.1)]:
-        print(f"\n  {severity}:")
-        cfgs = []
-        for i, bc in enumerate(base_configs):
-            cfgs.append({**bc, "alpha": alpha_val, "id": f"{bc['id']}-{severity[:4]}"})
-        exp3_results[severity] = {}
+    exp3 = {}
+    for alpha, label in [(5.0, "IID (α=5.0)"), (1.0, "Low (α=1.0)"),
+                          (0.5, "Medium (α=0.5)"), (0.1, "High (α=0.1)")]:
+        print(f"\n  {label}:")
+        exp3[label] = {}
         for method in ["FedAvg", "Ours"]:
-            fresh = create_clients(cfgs)
-            results = run_experiment(fresh, method, N_ROUNDS, global_embedding,
-                                    MODEL_ARCH, LOCAL_EPOCHS, LR)
-            exp3_results[severity][method] = results
-            print(f"    {method:8s}: loss={results[-1].global_loss:.4f}, acc={results[-1].global_accuracy:.4f}")
+            cl = make_clients(5, NCLS, alpha, DIM, 42)
+            r = run_fl(cl, method, ROUNDS, global_emb, ARCH, EPOCHS, LR)
+            exp3[label][method] = r
+            print(f"    {method:8s}: acc={r[-1].global_accuracy:.4f}")
 
-    # ============================================================
-    # Experiment 4: Heterogeneous Tasks (core contribution)
-    # 3 task types: inspection(10cls), grasping(6cls), assembly(4cls)
-    # Shared backbone, task-specific heads
-    # Task-aware should outperform FedAvg because it weights by task relevance
-    # ============================================================
+    # ═══════════════════════════════════════════════════════════
+    # Exp4: Heterogeneous Tasks (Shared Backbone)
+    # ═══════════════════════════════════════════════════════════
     print("\n" + "─" * 70)
-    print("  Experiment 4: Heterogeneous Tasks (Shared Backbone)")
-    print("  inspection(10cls) + grasping(6cls) + assembly(4cls)")
+    print("  Exp4: Heterogeneous Tasks (inspection + grasping + assembly)")
     print("─" * 70)
-
-    BACKBONE_ARCH = [INPUT_DIM, HIDDEN, 32]  # shared
-    HEAD_ARCHS = {
-        "inspection": [32, 16, 10],
-        "grasping": [32, 16, 6],
-        "assembly": [32, 16, 4],
-    }
-
-    exp4_configs = [
-        # 2 inspection factories (similar tasks)
-        {"id": "Insp-A (Suzhou)",   "task": "inspection", "domain": "electronics", "n": 500, "seed": 42},
-        {"id": "Insp-B (Shenzhen)", "task": "inspection", "domain": "semiconductor", "n": 450, "seed": 789},
-        # 2 grasping factories
-        {"id": "Grasp-A (Wuxi)",    "task": "grasping", "domain": "automotive", "n": 400, "seed": 123},
-        {"id": "Grasp-B (Dongguan)","task": "grasping", "domain": "logistics", "n": 380, "seed": 321},
-        # 1 assembly factory (dissimilar)
-        {"id": "Asm-A (Kunshan)",   "task": "assembly", "domain": "manufacturing", "n": 600, "seed": 456},
+    BB_ARCH = [DIM, 64, 32]
+    BACKBONE = [DIM, 64, 32]
+    tasks = [
+        ("inspection", 10, 500), ("grasping", 6, 400), ("assembly", 4, 350)
     ]
+    rng4 = np.random.RandomState(42)
+    W_lat = rng4.randn(DIM, 16).astype(np.float32) * 0.5
+    het_clients = []
+    for tname, tcls, tn in tasks:
+        X, y, _ = generate_non_iid(tn, tcls, 0.5, DIM, 42)
+        emb = rng4.randn(32).astype(np.float32) * 0.1
+        het_clients.append(ClientData(tname, X, y, _, tn, emb, tname))
 
-    # Task embeddings: same task → high similarity, different task → low similarity
-    task_type_embeddings = {
-        "inspection": np.array([1.0, 0.8, 0.2, 0.1, 0.0] + [0.3] * 27, dtype=np.float32),
-        "grasping":   np.array([0.2, 1.0, 0.7, 0.1, 0.0] + [0.3] * 27, dtype=np.float32),
-        "assembly":   np.array([0.1, 0.2, 1.0, 0.8, 0.5] + [0.3] * 27, dtype=np.float32),
-    }
-
-    # Global need: we want a backbone good at inspection + grasping (more factories)
-    global_emb_hetero = np.mean(
-        [task_type_embeddings[c["task"]] for c in exp4_configs], axis=0)
-
-    def create_hetero_clients(configs):
-        clients = []
-        for cfg in configs:
-            n_out = len(HEAD_ARCHS[cfg["task"]])
-            X, y, label_dist = generate_non_iid_data(
-                cfg["n"], n_out, 0.5, INPUT_DIM, cfg["seed"])
-            # Task embedding = task type + domain variation
-            emb = task_type_embeddings[cfg["task"]].copy()
-            rng = np.random.RandomState(cfg["seed"] + 999)
-            emb += rng.randn(32).astype(np.float32) * 0.1  # domain variation
-            clients.append(ClientData(
-                client_id=cfg["id"], X=X, y=y, label_dist=label_dist,
-                n_samples=cfg["n"], task_embedding=emb,
-                factory_type=f"{cfg['task']}/{cfg['domain']}"
-            ))
-        return clients
-
-    def run_hetero_experiment(clients, method, n_rounds, global_emb, local_epochs=5, lr=0.01):
-        """FL with shared backbone + task-specific heads."""
+    def run_hetero(method):
+        bb = MLP(BACKBONE, seed=42)
+        gbb = bb.get_params()
+        heads = {c.id: MLP([32, 16, c.y.shape[1]], seed=42) for c in het_clients}
         results = []
-        # Init backbone
-        backbone = MLP(BACKBONE_ARCH, seed=42)
-        global_bb_params = backbone.get_params()
-        bb_bytes = sum(p.nbytes for p in global_bb_params)
-
-        # Init heads per client
-        heads = {}
-        for c in clients:
-            n_out = c.y.shape[1]
-            heads[c.client_id] = MLP([32, 16, n_out], seed=42)
-
-        for rnd in range(1, n_rounds + 1):
+        for rnd in range(1, ROUNDS + 1):
             t0 = time.time()
-            bb_updates = []
-            client_weights = []
-            task_embs = []
-
-            for c in clients:
-                # Local backbone
-                local_bb = MLP(BACKBONE_ARCH, seed=42)
-                local_bb.set_params([p.copy() for p in global_bb_params])
-                local_head = heads[c.client_id]
-
-                # Train backbone + head jointly
-                for _ in range(local_epochs):
-                    # Forward
-                    feat = local_bb.forward(c.X)
-                    out = local_head.forward(feat)
-                    m = c.n_samples
+            lr_now = cosine_lr(0.001, rnd, ROUNDS)
+            bb_ups, cw, losses, tembs = [], [], [], []
+            for c in het_clients:
+                lbb = MLP(BACKBONE, seed=42)
+                lbb.set_params([p.copy() for p in gbb])
+                head = heads[c.id]
+                for _ in range(5):
+                    feat = lbb.forward(c.X)
+                    out = head.forward(feat)
+                    m = c.n
                     loss = -np.sum(c.y * np.log(out + 1e-8)) / m
-
-                    # Backprop head
-                    delta = (out - c.y) / m
-                    for i in range(len(local_head.weights) - 1, -1, -1):
-                        dw = local_head._activations[i].T @ delta
-                        db = np.sum(delta, axis=0)
+                    d = (out - c.y) / m
+                    for i in range(len(head.W) - 1, -1, -1):
+                        hdw = head._acts[i].T @ d
+                        hdb = d.sum(axis=0)
                         if i > 0:
-                            delta = (delta @ local_head.weights[i].T) * (local_head._pre_acts[i-1] > 0).astype(np.float32)
-                        else:
-                            # Last iteration: compute gradient w.r.t. input (features)
-                            delta = delta @ local_head.weights[i].T  # shape: (batch, 32)
-                        local_head.weights[i] -= lr * dw
-                        local_head.biases[i] -= lr * db
-
-                    # Backprop backbone
-                    delta_feat = delta  # shape: (batch, 32) = backbone output dim
-                    for i in range(len(local_bb.weights) - 1, -1, -1):
-                        dw = local_bb._activations[i].T @ delta_feat
-                        db = np.sum(delta_feat, axis=0)
+                            d = (d @ head.W[i].T) * (head._pre[i-1] > 0)
+                        head._adam(head.W[i], hdw, head._mw[i], head._vw[i], lr_now)
+                        head._adam(head.b[i], hdb, head._mb[i], head._vb[i], lr_now)
+                    # Backbone grad through head
+                    d_feat = d @ head.W[0].T
+                    d_bb = d_feat * (lbb._pre[-1] > 0)  # ReLU grad
+                    for i in range(len(lbb.W) - 1, -1, -1):
+                        bdw = lbb._acts[i].T @ d_bb
+                        bdb = d_bb.sum(axis=0)
                         if i > 0:
-                            delta_feat = (delta_feat @ local_bb.weights[i].T) * (local_bb._pre_acts[i-1] > 0).astype(np.float32)
-                        local_bb.weights[i] -= lr * dw
-                        local_bb.biases[i] -= lr * db
-
-                bb_updates.append({"params": local_bb.get_params()})
-                client_weights.append(c.n_samples)
-                task_embs.append(c.task_embedding)
-
-            # Aggregate backbone only
+                            d_bb = (d_bb @ lbb.W[i].T) * (lbb._pre[i-1] > 0)
+                        lbb._adam(lbb.W[i], bdw, lbb._mw[i], lbb._vw[i], lr_now)
+                        lbb._adam(lbb.b[i], bdb, lbb._mb[i], lbb._vb[i], lr_now)
+                bb_ups.append(lbb.get_params())
+                cw.append(c.n)
+                losses.append(loss)
+                tembs.append(c.task_emb)
             if method == "Ours":
-                new_bb, agg_info = aggregate_task_aware(
-                    bb_updates, client_weights, task_embs, global_emb, alpha=0.3, beta=0.7)
-                agg_weights = agg_info["weights"]
+                gbb = agg_ours(bb_ups, cw, losses, tembs, global_emb)
             else:
-                new_bb = aggregate_fedavg(bb_updates, client_weights)
-                agg_weights = None
-
-            global_bb_params = new_bb
-
-            # Evaluate
-            eval_bb = MLP(BACKBONE_ARCH, seed=42)
-            eval_bb.set_params(global_bb_params)
-            total_acc, total_loss, per_client = 0.0, 0.0, []
-            for c in clients:
-                feat = eval_bb.forward(c.X)
-                out = heads[c.client_id].forward(feat)
-                loss = -np.sum(c.y * np.log(out + 1e-8)) / c.n_samples
-                acc = float(np.mean(np.argmax(out, axis=1) == np.argmax(c.y, axis=1)))
-                total_acc += acc
-                total_loss += loss
-                per_client.append({"id": c.client_id, "loss": float(loss), "accuracy": float(acc)})
-
-            n_c = len(clients)
-            wt = time.time() - t0
-            results.append(RoundResult(
-                round_num=rnd, global_loss=total_loss/n_c, global_accuracy=total_acc/n_c,
-                per_client=per_client, communication_bytes=bb_bytes*n_c/1024,
-                wall_time=wt, aggregation_weights=agg_weights))
-
+                gbb = agg_fedavg(bb_ups, cw)
+            bb.set_params(gbb)
+            tl, ta, pc = 0.0, 0.0, []
+            for c in het_clients:
+                feat = bb.forward(c.X)
+                out = heads[c.id].forward(feat)
+                l = -np.sum(c.y * np.log(out + 1e-8)) / c.n
+                a = float(np.mean(np.argmax(out, 1) == np.argmax(c.y, 1)))
+                tl += l; ta += a
+                pc.append({"id": c.id, "loss": float(l), "accuracy": float(a)})
+            nc = len(het_clients)
+            results.append(RoundResult(rnd, tl/nc, ta/nc, pc))
             if rnd % 10 == 0 or rnd == 1:
-                print(f"    R{rnd:3d} | loss={results[-1].global_loss:.4f} | acc={results[-1].global_accuracy:.4f} | {wt:.2f}s")
-
+                print(f"    R{rnd:3d} | loss={tl/nc:.4f} | acc={ta/nc:.4f} | {time.time()-t0:.2f}s")
         return results
 
-    exp4_results = {}
+    exp4 = {}
     for method in ["FedAvg", "Ours"]:
         print(f"\n  Running {method}...")
-        fresh = create_hetero_clients(exp4_configs)
-        results = run_hetero_experiment(fresh, method, N_ROUNDS, global_emb_hetero)
-        exp4_results[method] = results
-        print(f"    Final: loss={results[-1].global_loss:.4f}, acc={results[-1].global_accuracy:.4f}")
+        r = run_hetero(method)
+        exp4[method] = r
+        print(f"  Final: loss={r[-1].global_loss:.4f}, acc={r[-1].global_accuracy:.4f}")
 
-    # ============================================================
+    # ═══════════════════════════════════════════════════════════
+    # Exp5: Continual Learning (EWC + Replay)
+    # ═══════════════════════════════════════════════════════════
+    print("\n" + "─" * 70)
+    print("  Exp5: Continual Learning (EWC + Replay vs Fine-tune)")
+    print("  Phase 1: classes 0-5 | Phase 2: classes 0-9 (new 6-9)")
+    print("─" * 70)
+
+    rng5 = np.random.RandomState(42)
+    N_P1, N_P2 = 6, 10
+
+    def make_phase_data(n_classes, total=800, seed=42):
+        r = np.random.RandomState(seed)
+        W = r.randn(DIM, 16).astype(np.float32) * 0.5
+        X, y = [], []
+        for c in range(n_classes):
+            nc = total // n_classes
+            lat = r.randn(nc, 16).astype(np.float32) + r.randn(1, 16) * 1.5
+            X.append(lat @ W.T + r.randn(nc, DIM) * 0.3)
+            yc = np.zeros((nc, N_P2), dtype=np.float32)
+            yc[:, c] = 1.0
+            y.append(yc)
+        return np.vstack(X).astype(np.float32), np.vstack(y)
+
+    X_p1, y_p1 = make_phase_data(N_P1, 800, 42)
+    X_p2, y_p2 = make_phase_data(N_P2, 800, 43)
+
+    def run_ewc_exp(use_ewc, use_replay, lam=10.0, replay_ratio=0.2):
+        model = MLP([DIM, HID, 64, N_P2], seed=42)
+        ewc = EWC(model, lam) if use_ewc else None
+        results = []
+        total_steps = 50
+
+        # Phase 1: classes 0-5
+        for step in range(1, 26):
+            lr_now = cosine_lr(0.001, step, total_steps, warmup=3)
+            idx = np.random.permutation(len(X_p1))
+            loss = model.train_step(X_p1[idx], y_p1[idx], lr=lr_now)
+            # No EWC penalty in Phase 1 (not yet consolidated)
+            acc_old = model.accuracy(X_p1, y_p1)
+            results.append({"step": step, "phase": 1, "acc_old": acc_old, "acc_new": 0.0})
+
+        if ewc:
+            ewc.consolidate(X_p1, y_p1)
+
+        # Phase 2: classes 0-9 with optional replay
+        replay_size = int(len(X_p1) * replay_ratio) if use_replay else 0
+        for step in range(26, 51):
+            lr_now = cosine_lr(0.001, step, total_steps, warmup=3)
+            idx = np.random.permutation(len(X_p2))
+            X_batch, y_batch = X_p2[idx], y_p2[idx]
+
+            # Mix in replay data
+            if use_replay and replay_size > 0:
+                ridx = np.random.choice(len(X_p1), replay_size, replace=False)
+                X_batch = np.vstack([X_batch, X_p1[ridx]])
+                y_batch = np.vstack([y_batch, y_p1[ridx]])
+
+            loss = model.train_step(X_batch, y_batch, lr=lr_now)
+            if ewc:
+                ewc.grad_penalty(lr_now)
+            acc_old = model.accuracy(X_p1, y_p1)
+            acc_new = model.accuracy(X_p2, y_p2)
+            results.append({"step": step, "phase": 2, "acc_old": acc_old, "acc_new": acc_new})
+        return results
+
+    exp5 = {}
+    configs = [
+        ("Fine-tune", False, False),
+        ("EWC only", True, False),
+        ("Replay only", False, True),
+        ("EWC + Replay", True, True),
+    ]
+    for label, use_ewc, use_replay in configs:
+        print(f"\n  Running {label}...")
+        r = run_ewc_exp(use_ewc, use_replay)
+        exp5[label] = r
+        print(f"    Phase 2 end: old={r[-1]['acc_old']:.4f}, new={r[-1]['acc_new']:.4f}")
+
+    # ═══════════════════════════════════════════════════════════
+    # Exp6: Gradient Compression
+    # ═══════════════════════════════════════════════════════════
+    print("\n" + "─" * 70)
+    print("  Exp6: Gradient Compression (50 training steps)")
+    print("─" * 70)
+
+    # Use IID data for compression experiment (focus on compression, not Non-IID)
+    rng_c = np.random.RandomState(42)
+    X_all = rng_c.randn(800, DIM).astype(np.float32)
+    y_all = np.zeros((800, NCLS), dtype=np.float32)
+    for i in range(800):
+        y_all[i, i % NCLS] = 1.0
+    # Add some structure so it's not trivially separable
+    W_proj = rng_c.randn(DIM, 16).astype(np.float32) * 0.5
+    for c in range(NCLS):
+        mask = np.arange(800) % NCLS == c
+        X_all[mask] += rng_c.randn(mask.sum(), DIM).astype(np.float32) * 0.5
+
+    X_comp, y_comp = X_all[:600], y_all[:600]
+    X_val, y_val = X_all[600:], y_all[600:]
+    n_params = MLP(ARCH, seed=42).param_count()
+    print(f"  Model: {n_params} params | Train: 600 | Val: 200 (IID)")
+
+    def train_with_compression(compress_fn, n_steps=50, label=""):
+        model = MLP(ARCH, seed=42)
+        for step in range(1, n_steps + 1):
+            lr_now = cosine_lr(0.001, step, n_steps, warmup=3)
+            idx = np.random.permutation(len(X_comp))
+            grads = model.compute_grad(X_comp[idx], y_comp[idx])
+            if compress_fn:
+                grads, _ = compress_fn(grads)
+            model.apply_grad(grads, lr=lr_now)
+        return model.accuracy(X_val, y_val)
+
+    exp6 = {}
+
+    # Baseline (no compression)
+    acc_base = train_with_compression(None, 50)
+    exp6["No compression"] = {"ratio": 1.0, "accuracy": acc_base, "bytes": n_params * 4}
+    print(f"\n  No compression: acc={acc_base:.4f}")
+
+    # Top-K
+    print("\n  Top-K Sparsification:")
+    for sp in [0.5, 0.7, 0.9, 0.95, 0.99]:
+        _, info = topk_sparsify([np.zeros(100)], sp)  # just get ratio
+        # Actual training
+        def make_topk(s=sp):
+            return lambda g: topk_sparsify(g, s)
+        acc = train_with_compression(make_topk(), 50)
+        _, stats = topk_sparsify([np.zeros(n_params)], sp)
+        exp6[f"TopK-{int(sp*100)}"] = {"ratio": stats["ratio"], "accuracy": acc, "bytes": int(stats["nonzero"] * 6)}
+        print(f"    {int(sp*100)}%: {stats['ratio']:.1f}x, acc={acc:.4f}")
+
+    # Quantization
+    print("\n  Quantization:")
+    for bits in [16, 8, 4]:
+        def make_quant(b=bits):
+            return lambda g: quantize_grads(g, b)
+        acc = train_with_compression(make_quant(), 50)
+        _, stats = quantize_grads([np.zeros(n_params, dtype=np.float32)], bits)
+        exp6[f"Quant-{bits}bit"] = {"ratio": stats["ratio"], "accuracy": acc, "bytes": stats["bytes"]}
+        print(f"    {bits}-bit: {stats['ratio']:.1f}x, acc={acc:.4f}")
+
+    # ═══════════════════════════════════════════════════════════
     # Summary
-    # ============================================================
+    # ═══════════════════════════════════════════════════════════
     print("\n" + "=" * 70)
     print("  SUMMARY")
     print("=" * 70)
 
-    print(f"\n  Experiment 1 (5 factories, {N_ROUNDS} rounds, Non-IID):")
-    print(f"  {'Method':<10} {'Final Loss':>12} {'Final Acc':>12} {'Best Acc':>12} {'Δ vs FedAvg':>14}")
-    print(f"  {'─'*10} {'─'*12} {'─'*12} {'─'*12} {'─'*14}")
-    fa_loss = all_results["FedAvg"][-1].global_loss
-    fa_acc = all_results["FedAvg"][-1].global_accuracy
-    for method in ["FedAvg", "FedProx", "Ours"]:
-        r = all_results[method]
-        best = max(rr.global_accuracy for rr in r)
-        delta_l = (fa_loss - r[-1].global_loss) / fa_loss * 100
-        star = " ★" if method == "Ours" else ""
-        print(f"  {method:<10} {r[-1].global_loss:>12.4f} {r[-1].global_accuracy:>12.4f} "
-              f"{best:>12.4f} {delta_l:>+13.1f}%{star}")
+    print(f"\n  Exp1 (5 factories, {ROUNDS} rounds):")
+    fa1 = exp1["FedAvg"][-1].global_accuracy
+    for m in ["FedAvg", "FedProx", "Ours"]:
+        r = exp1[m][-1]
+        d = (r.global_accuracy - fa1) / max(fa1, 1e-8) * 100
+        star = " ★" if d > 0.5 else ""
+        print(f"    {m:10s} loss={r.global_loss:.4f} acc={r.global_accuracy:.4f} ({d:+.1f}%){star}")
 
-    print(f"\n  Experiment 4 (Heterogeneous Tasks, {N_ROUNDS} rounds):")
-    print(f"  {'Method':<10} {'Final Loss':>12} {'Final Acc':>12} {'Δ vs FedAvg':>14}")
-    print(f"  {'─'*10} {'─'*12} {'─'*12} {'─'*14}")
-    fa4_loss = exp4_results["FedAvg"][-1].global_loss
-    fa4_acc = exp4_results["FedAvg"][-1].global_accuracy
-    for method in ["FedAvg", "Ours"]:
-        r = exp4_results[method][-1]
-        delta_l = (fa4_loss - r.global_loss) / fa4_loss * 100
-        delta_a = (r.global_accuracy - fa4_acc) / max(fa4_acc, 1e-8) * 100
-        star = " ★" if method == "Ours" else ""
-        print(f"  {method:<10} {r.global_loss:>12.4f} {r.global_accuracy:>12.4f} {delta_l:>+13.1f}%{star}")
+    print(f"\n  Exp2 (10 factories):")
+    fa2 = exp2["FedAvg"][-1].global_accuracy
+    for m in ["FedAvg", "Ours"]:
+        r = exp2[m][-1]
+        d = (r.global_accuracy - fa2) / max(fa2, 1e-8) * 100
+        star = " ★" if d > 0.5 else ""
+        print(f"    {m:10s} loss={r.global_loss:.4f} acc={r.global_accuracy:.4f} ({d:+.1f}%){star}")
 
-    print(f"\n  Experiment 3 (Non-IID severity):")
-    print(f"  {'Severity':<18} {'FedAvg Acc':>12} {'Ours Acc':>12} {'Improvement':>14}")
-    print(f"  {'─'*18} {'─'*12} {'─'*12} {'─'*14}")
-    for sev in exp3_results:
-        fa = exp3_results[sev]["FedAvg"][-1].global_accuracy
-        ou = exp3_results[sev]["Ours"][-1].global_accuracy
-        imp = (ou - fa) / max(fa, 1e-8) * 100
-        print(f"  {sev:<18} {fa:>12.4f} {ou:>12.4f} {imp:>+13.1f}%")
+    print(f"\n  Exp3 (Non-IID severity):")
+    for sev in exp3:
+        fa = exp3[sev]["FedAvg"][-1].global_accuracy
+        ou = exp3[sev]["Ours"][-1].global_accuracy
+        d = (ou - fa) / max(fa, 1e-8) * 100
+        print(f"    {sev:20s} FedAvg={fa:.4f} Ours={ou:.4f} ({d:+.1f}%)")
 
-    # Save
+    print(f"\n  Exp4 (Heterogeneous):")
+    fa4 = exp4["FedAvg"][-1].global_accuracy
+    for m in ["FedAvg", "Ours"]:
+        r = exp4[m][-1]
+        d = (r.global_accuracy - fa4) / max(fa4, 1e-8) * 100
+        star = " ★" if d > 0.5 else ""
+        print(f"    {m:10s} acc={r.global_accuracy:.4f} ({d:+.1f}%){star}")
+
+    print(f"\n  Exp5 (Continual Learning):")
+    ft_old = exp5["Fine-tune"][-1]["acc_old"]
+    for label in exp5:
+        r = exp5[label][-1]
+        d = (r["acc_old"] - ft_old) / max(ft_old, 1e-8) * 100
+        star = " ★" if d > 5 else ""
+        print(f"    {label:16s} old={r['acc_old']:.4f} new={r['acc_new']:.4f} (Δold={d:+.1f}%){star}")
+
+    print(f"\n  Exp6 (Compression):")
+    for label, info in exp6.items():
+        print(f"    {label:18s} {info['ratio']:>6.1f}x  acc={info['accuracy']:.4f}")
+
+    # ═══════════════════════════════════════════════════════════
+    # Save results
+    # ═══════════════════════════════════════════════════════════
+    def ser_rounds(rds):
+        return [{"round": r.round_num, "loss": r.global_loss,
+                 "accuracy": r.global_accuracy} for r in rds]
+
     output = {
-        "config": {
-            "model_arch": MODEL_ARCH, "n_rounds": N_ROUNDS,
-            "local_epochs": LOCAL_EPOCHS, "lr": LR, "n_classes": N_CLASSES,
-        },
-        "exp1": {method: [{"round": r.round_num, "loss": r.global_loss,
-                            "accuracy": r.global_accuracy} for r in results]
-                 for method, results in all_results.items()},
-        "exp2": {method: [{"round": r.round_num, "loss": r.global_loss,
-                            "accuracy": r.global_accuracy} for r in results]
-                 for method, results in exp2_results.items()},
-        "exp3": {sev: {method: [{"round": r.round_num, "loss": r.global_loss,
-                                  "accuracy": r.global_accuracy} for r in results]
-                       for method, results in methods.items()}
-                 for sev, methods in exp3_results.items()},
-        "exp4_hetero": {method: [{"round": r.round_num, "loss": r.global_loss,
-                                   "accuracy": r.global_accuracy,
-                                   "per_client": r.per_client} for r in results]
-                        for method, results in exp4_results.items()},
+        "config": {"arch": ARCH, "rounds": ROUNDS, "lr": LR, "optimizer": "Adam"},
+        "exp1": {m: ser_rounds(r) for m, r in exp1.items()},
+        "exp2": {m: ser_rounds(r) for m, r in exp2.items()},
+        "exp3": {s: {m: ser_rounds(r) for m, r in methods.items()} for s, methods in exp3.items()},
+        "exp4": {m: ser_rounds(r) for m, r in exp4.items()},
+        "exp5": {l: [{"step": r["step"], "phase": r["phase"],
+                       "acc_old": r["acc_old"], "acc_new": r["acc_new"]} for r in rs]
+                 for l, rs in exp5.items()},
+        "exp6": exp6,
     }
 
     results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
     os.makedirs(results_dir, exist_ok=True)
+    with open(f"{results_dir}/experiment_results.json", "w") as f:
+        json.dump(output, f, indent=2, default=lambda o: float(o))
+    print(f"\n✅ Results saved to {results_dir}/experiment_results.json")
 
-    out_path = os.path.join(results_dir, "experiment_results.json")
-    with open(out_path, "w") as f:
-        json.dump(output, f, indent=2)
-    print(f"\n✅ Results saved to {out_path}")
+    # ═══════════════════════════════════════════════════════════
+    # Generate Plots
+    # ═══════════════════════════════════════════════════════════
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
 
-    # Generate plots
-    generate_plots(output, results_dir)
+        colors = {"FedAvg": "#e74c3c", "FedProx": "#f39c12", "Ours": "#2ecc71"}
+        markers = {"FedAvg": "o", "FedProx": "s", "Ours": "^"}
 
-    return output
+        # Fig 1: Convergence
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
+        for m in ["FedAvg", "FedProx", "Ours"]:
+            rds = exp1[m]
+            ax1.plot([r.round_num for r in rds], [r.global_loss for r in rds],
+                    label=m, color=colors[m], marker=markers[m], markersize=2, linewidth=1.5)
+            ax2.plot([r.round_num for r in rds], [r.global_accuracy for r in rds],
+                    label=m, color=colors[m], marker=markers[m], markersize=2, linewidth=1.5)
+        ax1.set_xlabel("Round"); ax1.set_ylabel("Loss"); ax1.set_title("(a) Loss"); ax1.legend()
+        ax2.set_xlabel("Round"); ax2.set_ylabel("Accuracy"); ax2.set_title("(b) Accuracy"); ax2.legend()
+        plt.tight_layout(); plt.savefig(f"{results_dir}/fig1_convergence.png"); plt.close()
+        print("  ✅ fig1_convergence.png")
 
+        # Fig 2: Non-IID severity bar chart
+        fig, ax = plt.subplots(figsize=(8, 5))
+        sevs = list(exp3.keys())
+        x = np.arange(len(sevs))
+        w = 0.35
+        fa_accs = [exp3[s]["FedAvg"][-1].global_accuracy for s in sevs]
+        ou_accs = [exp3[s]["Ours"][-1].global_accuracy for s in sevs]
+        ax.bar(x - w/2, fa_accs, w, label="FedAvg", color="#e74c3c", alpha=0.8)
+        ax.bar(x + w/2, ou_accs, w, label="Ours", color="#2ecc71", alpha=0.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels([s.split("(")[0].strip() for s in sevs], rotation=15)
+        ax.set_ylabel("Accuracy"); ax.set_title("Non-IID Severity: FedAvg vs Ours"); ax.legend()
+        for i, (fa, ou) in enumerate(zip(fa_accs, ou_accs)):
+            ax.text(i - w/2, fa + 0.005, f"{fa:.3f}", ha='center', fontsize=7)
+            ax.text(i + w/2, ou + 0.005, f"{ou:.3f}", ha='center', fontsize=7)
+        plt.tight_layout(); plt.savefig(f"{results_dir}/fig2_noniid_severity.png"); plt.close()
+        print("  ✅ fig2_noniid_severity.png")
 
-def generate_plots(data: dict, output_dir: str):
-    """Generate publication-quality plots."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
+        # Fig 3: Scalability
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
+        for m in ["FedAvg", "Ours"]:
+            rds = exp2[m]
+            ax1.plot([r.round_num for r in rds], [r.global_loss for r in rds],
+                    label=m, color=colors[m], linewidth=1.5)
+            ax2.plot([r.round_num for r in rds], [r.global_accuracy for r in rds],
+                    label=m, color=colors[m], linewidth=1.5)
+        ax1.set_xlabel("Round"); ax1.set_ylabel("Loss"); ax1.set_title("(a) 10 Clients Loss"); ax1.legend()
+        ax2.set_xlabel("Round"); ax2.set_ylabel("Accuracy"); ax2.set_title("(b) 10 Clients Accuracy"); ax2.legend()
+        plt.tight_layout(); plt.savefig(f"{results_dir}/fig3_scalability.png"); plt.close()
+        print("  ✅ fig3_scalability.png")
 
-    plt.rcParams.update({
-        'font.family': 'serif',
-        'font.size': 11,
-        'figure.dpi': 150,
-        'savefig.dpi': 300,
-        'savefig.bbox': 'tight',
-        'axes.grid': True,
-        'grid.alpha': 0.3,
-    })
+        # Fig 4: EWC + Replay
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
+        ewc_colors = {"Fine-tune": "#e74c3c", "EWC only": "#3498db",
+                      "Replay only": "#f39c12", "EWC + Replay": "#2ecc71"}
+        for label, rds in exp5.items():
+            steps = [r["step"] for r in rds]
+            ax1.plot(steps, [r["acc_old"] for r in rds], label=label,
+                    color=ewc_colors[label], linewidth=1.5)
+            p2 = [r for r in rds if r["phase"] == 2]
+            if p2:
+                ax2.plot([r["step"] for r in p2], [r["acc_new"] for r in p2],
+                        label=label, color=ewc_colors[label], linewidth=1.5)
+        ax1.axvline(x=25, color='gray', linestyle='--', alpha=0.5)
+        ax1.set_xlabel("Step"); ax1.set_ylabel("Old Classes Acc")
+        ax1.set_title("(a) Forgetting Prevention"); ax1.legend(fontsize=7)
+        ax2.set_xlabel("Step (Phase 2)"); ax2.set_ylabel("New Classes Acc")
+        ax2.set_title("(b) New Task Learning"); ax2.legend(fontsize=7)
+        plt.tight_layout(); plt.savefig(f"{results_dir}/fig4_ewc_replay.png"); plt.close()
+        print("  ✅ fig4_ewc_replay.png")
 
-    colors = {'FedAvg': '#1f77b4', 'FedProx': '#ff7f0e', 'Ours': '#2ca02c'}
-    markers = {'FedAvg': 'o', 'FedProx': 's', 'Ours': 'D'}
-    linestyles = {'FedAvg': '-', 'FedProx': '--', 'Ours': '-'}
+        # Fig 5: Compression trade-off
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ms, cs, acs, cls = [], [], [], []
+        for label, info in exp6.items():
+            ms.append(label); cs.append(info["ratio"]); acs.append(info["accuracy"])
+            cls.append("#3498db" if "TopK" in label else "#e67e22" if "Quant" in label else "#95a5a6")
+        ax.scatter(cs, acs, c=cls, s=100, zorder=5, edgecolors='white')
+        for i, m in enumerate(ms):
+            ax.annotate(m, (cs[i], acs[i]), textcoords="offset points", xytext=(8, 5), fontsize=7)
+        ax.set_xlabel("Compression Ratio (×)"); ax.set_ylabel("Accuracy")
+        ax.set_title("Communication Cost vs Accuracy"); ax.set_xscale("log"); ax.grid(True, alpha=0.3)
+        plt.tight_layout(); plt.savefig(f"{results_dir}/fig5_compression_tradeoff.png"); plt.close()
+        print("  ✅ fig5_compression_tradeoff.png")
 
-    # === Fig 1: Convergence curves (Exp1) ===
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
-
-    for method in ["FedAvg", "FedProx", "Ours"]:
-        rounds = [r["round"] for r in data["exp1"][method]]
-        losses = [r["loss"] for r in data["exp1"][method]]
-        accs = [r["accuracy"] for r in data["exp1"][method]]
-        ax1.plot(rounds, losses, label=method, color=colors[method],
-                marker=markers[method], markersize=3, linestyle=linestyles[method], linewidth=1.5)
-        ax2.plot(rounds, accs, label=method, color=colors[method],
-                marker=markers[method], markersize=3, linestyle=linestyles[method], linewidth=1.5)
-
-    ax1.set_xlabel("Federated Round")
-    ax1.set_ylabel("Global Loss (Cross-Entropy)")
-    ax1.set_title("(a) Convergence - Loss")
-    ax1.legend()
-
-    ax2.set_xlabel("Federated Round")
-    ax2.set_ylabel("Global Accuracy")
-    ax2.set_title("(b) Convergence - Accuracy")
-    ax2.legend()
-
-    plt.savefig(f"{output_dir}/fig1_convergence.png")
-    plt.close()
-    print(f"  ✅ fig1_convergence.png")
-
-    # === Fig 2: Non-IID severity (Exp3) ===
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    severities = list(data["exp3"].keys())
-    x = np.arange(len(severities))
-    width = 0.35
-
-    fedavg_accs = [data["exp3"][s]["FedAvg"][-1]["accuracy"] for s in severities]
-    ours_accs = [data["exp3"][s]["Ours"][-1]["accuracy"] for s in severities]
-
-    bars1 = ax.bar(x - width/2, fedavg_accs, width, label='FedAvg', color=colors["FedAvg"], alpha=0.8)
-    bars2 = ax.bar(x + width/2, ours_accs, width, label='Ours (Task-Aware)', color=colors["Ours"], alpha=0.8)
-
-    ax.set_xlabel("Non-IID Severity")
-    ax.set_ylabel("Final Accuracy")
-    ax.set_title("Impact of Non-IID Severity on Model Performance")
-    ax.set_xticks(x)
-    ax.set_xticklabels(severities, rotation=15, ha='right')
-    ax.legend()
-
-    # Add value labels
-    for bar in bars1:
-        ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.005,
-                f'{bar.get_height():.3f}', ha='center', va='bottom', fontsize=8)
-    for bar in bars2:
-        ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.005,
-                f'{bar.get_height():.3f}', ha='center', va='bottom', fontsize=8)
-
-    plt.savefig(f"{output_dir}/fig2_noniid_severity.png")
-    plt.close()
-    print(f"  ✅ fig2_noniid_severity.png")
-
-    # === Fig 3: Scalability (Exp2) ===
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
-
-    for method in ["FedAvg", "Ours"]:
-        rounds = [r["round"] for r in data["exp2"][method]]
-        losses = [r["loss"] for r in data["exp2"][method]]
-        accs = [r["accuracy"] for r in data["exp2"][method]]
-        ax1.plot(rounds, losses, label=method, color=colors[method],
-                marker=markers[method], markersize=3, linestyle=linestyles[method], linewidth=1.5)
-        ax2.plot(rounds, accs, label=method, color=colors[method],
-                marker=markers[method], markersize=3, linestyle=linestyles[method], linewidth=1.5)
-
-    ax1.set_xlabel("Federated Round")
-    ax1.set_ylabel("Global Loss")
-    ax1.set_title("(a) 10 Clients - Loss")
-    ax1.legend()
-    ax2.set_xlabel("Federated Round")
-    ax2.set_ylabel("Global Accuracy")
-    ax2.set_title("(b) 10 Clients - Accuracy")
-    ax2.legend()
-
-    plt.savefig(f"{output_dir}/fig3_scalability.png")
-    plt.close()
-    print(f"  ✅ fig3_scalability.png")
-
-    print(f"\n  All plots saved to {output_dir}/")
+        print(f"\n  All plots saved to {results_dir}/")
+    except ImportError:
+        print("  ⚠ matplotlib not available, skipping plots")
 
 
 if __name__ == "__main__":
