@@ -579,7 +579,7 @@ def main():
     X_p1, y_p1 = make_phase_data(N_P1, 800, 42)
     X_p2, y_p2 = make_phase_data(N_P2, 800, 43)
 
-    def run_ewc_exp(use_ewc, use_replay, lam=10.0, replay_ratio=0.2):
+    def run_ewc_exp(use_ewc, use_replay, lam=5000.0, replay_ratio=0.2):
         model = MLP([DIM, HID, 64, N_P2], seed=42)
         ewc = EWC(model, lam) if use_ewc else None
         results = []
@@ -589,8 +589,7 @@ def main():
         for step in range(1, 26):
             lr_now = cosine_lr(0.001, step, total_steps, warmup=3)
             idx = np.random.permutation(len(X_p1))
-            loss = model.train_step(X_p1[idx], y_p1[idx], lr=lr_now)
-            # No EWC penalty in Phase 1 (not yet consolidated)
+            model.train_step(X_p1[idx], y_p1[idx], lr=lr_now)
             acc_old = model.accuracy(X_p1, y_p1)
             results.append({"step": step, "phase": 1, "acc_old": acc_old, "acc_new": 0.0})
 
@@ -598,6 +597,7 @@ def main():
             ewc.consolidate(X_p1, y_p1)
 
         # Phase 2: classes 0-9 with optional replay
+        # Use compute_grad + apply_grad so EWC gradient flows through Adam
         replay_size = int(len(X_p1) * replay_ratio) if use_replay else 0
         for step in range(26, 51):
             lr_now = cosine_lr(0.001, step, total_steps, warmup=3)
@@ -610,9 +610,15 @@ def main():
                 X_batch = np.vstack([X_batch, X_p1[ridx]])
                 y_batch = np.vstack([y_batch, y_p1[ridx]])
 
-            loss = model.train_step(X_batch, y_batch, lr=lr_now)
-            if ewc:
-                ewc.grad_penalty(lr_now)
+            # Compute task gradient
+            grads = model.compute_grad(X_batch, y_batch)
+            # Add EWC regularization gradient (goes through Adam properly)
+            if ewc and ewc.fisher is not None:
+                for i in range(len(model.W)):
+                    grads[2*i] += ewc.lam * ewc.fisher[2*i] * (model.W[i] - ewc.star_params[2*i])
+                    grads[2*i+1] += ewc.lam * ewc.fisher[2*i+1] * (model.b[i] - ewc.star_params[2*i+1])
+            model.apply_grad(grads, lr=lr_now)
+
             acc_old = model.accuracy(X_p1, y_p1)
             acc_new = model.accuracy(X_p2, y_p2)
             results.append({"step": step, "phase": 2, "acc_old": acc_old, "acc_new": acc_new})
@@ -635,27 +641,32 @@ def main():
     # Exp6: Gradient Compression
     # ═══════════════════════════════════════════════════════════
     print("\n" + "─" * 70)
-    print("  Exp6: Gradient Compression (50 training steps)")
+    print("  Exp6: Gradient Compression (100 training steps)")
     print("─" * 70)
 
-    # Use IID data for compression experiment (focus on compression, not Non-IID)
+    # Use structured IID data (per-class latent centers, like generate_non_iid but uniform)
     rng_c = np.random.RandomState(42)
-    X_all = rng_c.randn(800, DIM).astype(np.float32)
-    y_all = np.zeros((800, NCLS), dtype=np.float32)
-    for i in range(800):
-        y_all[i, i % NCLS] = 1.0
-    # Add some structure so it's not trivially separable
-    W_proj = rng_c.randn(DIM, 16).astype(np.float32) * 0.5
+    W_lat_c = rng_c.randn(DIM, 16).astype(np.float32) * 0.5
+    X_parts, y_parts = [], []
     for c in range(NCLS):
-        mask = np.arange(800) % NCLS == c
-        X_all[mask] += rng_c.randn(mask.sum(), DIM).astype(np.float32) * 0.5
+        nc = 80  # 800 / 10 = 80 per class
+        lat = rng_c.randn(nc, 16).astype(np.float32) + rng_c.randn(1, 16) * 1.5
+        X_parts.append(lat @ W_lat_c.T + rng_c.randn(nc, DIM) * 0.3)
+        yc = np.zeros((nc, NCLS), dtype=np.float32)
+        yc[:, c] = 1.0
+        y_parts.append(yc)
+    X_all = np.vstack(X_parts).astype(np.float32)
+    y_all = np.vstack(y_parts)
 
+    # Shuffle before splitting to ensure balanced train/val
+    shuffle_idx = np.random.RandomState(99).permutation(800)
+    X_all, y_all = X_all[shuffle_idx], y_all[shuffle_idx]
     X_comp, y_comp = X_all[:600], y_all[:600]
     X_val, y_val = X_all[600:], y_all[600:]
     n_params = MLP(ARCH, seed=42).param_count()
-    print(f"  Model: {n_params} params | Train: 600 | Val: 200 (IID)")
+    print(f"  Model: {n_params} params | Train: 600 | Val: 200 (structured IID, shuffled)")
 
-    def train_with_compression(compress_fn, n_steps=50, label=""):
+    def train_with_compression(compress_fn, n_steps=100, label=""):
         model = MLP(ARCH, seed=42)
         for step in range(1, n_steps + 1):
             lr_now = cosine_lr(0.001, step, n_steps, warmup=3)
@@ -669,31 +680,33 @@ def main():
     exp6 = {}
 
     # Baseline (no compression)
-    acc_base = train_with_compression(None, 50)
+    acc_base = train_with_compression(None, 100)
     exp6["No compression"] = {"ratio": 1.0, "accuracy": acc_base, "bytes": n_params * 4}
     print(f"\n  No compression: acc={acc_base:.4f}")
 
     # Top-K
     print("\n  Top-K Sparsification:")
     for sp in [0.5, 0.7, 0.9, 0.95, 0.99]:
-        _, info = topk_sparsify([np.zeros(100)], sp)  # just get ratio
+        theoretical_ratio = 1.0 / (1.0 - sp)
+        nonzero = int(n_params * (1.0 - sp))
         # Actual training
         def make_topk(s=sp):
             return lambda g: topk_sparsify(g, s)
-        acc = train_with_compression(make_topk(), 50)
-        _, stats = topk_sparsify([np.zeros(n_params)], sp)
-        exp6[f"TopK-{int(sp*100)}"] = {"ratio": stats["ratio"], "accuracy": acc, "bytes": int(stats["nonzero"] * 6)}
-        print(f"    {int(sp*100)}%: {stats['ratio']:.1f}x, acc={acc:.4f}")
+        acc = train_with_compression(make_topk(), 100)
+        exp6[f"TopK-{int(sp*100)}"] = {"ratio": theoretical_ratio, "accuracy": acc, "bytes": nonzero * 6}
+        print(f"    {int(sp*100)}%: {theoretical_ratio:.1f}x, acc={acc:.4f}")
 
     # Quantization
     print("\n  Quantization:")
     for bits in [16, 8, 4]:
         def make_quant(b=bits):
             return lambda g: quantize_grads(g, b)
-        acc = train_with_compression(make_quant(), 50)
-        _, stats = quantize_grads([np.zeros(n_params, dtype=np.float32)], bits)
-        exp6[f"Quant-{bits}bit"] = {"ratio": stats["ratio"], "accuracy": acc, "bytes": stats["bytes"]}
-        print(f"    {bits}-bit: {stats['ratio']:.1f}x, acc={acc:.4f}")
+        acc = train_with_compression(make_quant(), 100)
+        bpv = max(1, bits // 8)
+        q_ratio = 32.0 / bits  # float32 → bits
+        q_bytes = int(n_params * bpv)
+        exp6[f"Quant-{bits}bit"] = {"ratio": q_ratio, "accuracy": acc, "bytes": q_bytes}
+        print(f"    {bits}-bit: {q_ratio:.1f}x, acc={acc:.4f}")
 
     # ═══════════════════════════════════════════════════════════
     # Summary
