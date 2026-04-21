@@ -1,0 +1,47 @@
+[package]
+name = "embodied-fl"
+version = "0.1.0"
+edition = "2021"
+description = "Federated Learning Platform for Embodied Intelligence — distributed robot training with data privacy"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["federated-learning", "embodied-ai", "robotics", "reinforcement-learning", "hnsw", "rust"]
+categories = ["science", "simulation"]
+repository = "https://github.com/dechang64/embodied-fl"
+
+[dependencies]
+# gRPC
+tonic = "0.13"
+prost = "0.13"
+tokio = { version = "1", features = ["full"] }
+
+# Web
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Vector Search
+hnsw = "0.12"
+space = "0.17"
+
+# Audit
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Error handling
+anyhow = "1"
+
+[build-dependencies]
+tonic-build = "0.13"
