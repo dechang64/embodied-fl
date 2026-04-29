@@ -1,0 +1,115 @@
+{
+  "config": {
+    "mode": "quick",
+    "n_clients": 3,
+    "rounds": 3,
+    "local_epochs": 1,
+    "episodes_per_client": 5,
+    "steps_per_episode": 10,
+    "d_model": 32,
+    "n_heads": 2,
+    "n_fusion_layers": 1,
+    "lr": 0.01,
+    "action_dim": 4,
+    "num_action_bins": 16,
+    "batch_size": 16,
+    "vision_dim": 64,
+    "lang_dim": 64,
+    "state_dim": 4,
+    "seed": 42,
+    "results_dir": "results/vla_fed"
+  },
+  "history": [
+    {
+      "round": 1,
+      "global_accuracy": 0.056666666020949684,
+      "avg_client_loss": 2.887282371520996,
+      "avg_client_accuracy": 0.3000000019868215,
+      "elapsed": 0.029165983200073242,
+      "client_metrics": [
+        {
+          "client_id": "factory_a_smt",
+          "task_type": "grasping",
+          "loss": 2.9881484508514404,
+          "accuracy": 0.24500000476837158,
+          "n_samples": 50
+        },
+        {
+          "client_id": "factory_b_assembly",
+          "task_type": "assembly",
+          "loss": 2.783884286880493,
+          "accuracy": 0.33000001311302185,
+          "n_samples": 50
+        },
+        {
+          "client_id": "factory_c_inspect",
+          "task_type": "inspection",
+          "loss": 2.8898143768310547,
+          "accuracy": 0.32499998807907104,
+          "n_samples": 50
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "global_accuracy": 0.06833333397905032,
+      "avg_client_loss": 3.0173800786336265,
+      "avg_client_accuracy": 0.3216666678587596,
+      "elapsed": 0.022892475128173828,
+      "client_metrics": [
+        {
+          "client_id": "factory_a_smt",
+          "task_type": "grasping",
+          "loss": 2.9948554039001465,
+          "accuracy": 0.32499998807907104,
+          "n_samples": 50
+        },
+        {
+          "client_id": "factory_b_assembly",
+          "task_type": "assembly",
+          "loss": 2.9480478763580322,
+          "accuracy": 0.33000001311302185,
+          "n_samples": 50
+        },
+        {
+          "client_id": "factory_c_inspect",
+          "task_type": "inspection",
+          "loss": 3.1092369556427,
+          "accuracy": 0.3100000023841858,
+          "n_samples": 50
+        }
+      ]
+    },
+    {
+      "round": 3,
+      "global_accuracy": 0.06833333397905032,
+      "avg_client_loss": 3.057079871495565,
+      "avg_client_accuracy": 0.3566666642824809,
+      "elapsed": 0.022657155990600586,
+      "client_metrics": [
+        {
+          "client_id": "factory_a_smt",
+          "task_type": "grasping",
+          "loss": 2.953228712081909,
+          "accuracy": 0.4749999940395355,
+          "n_samples": 50
+        },
+        {
+          "client_id": "factory_b_assembly",
+          "task_type": "assembly",
+          "loss": 3.106508493423462,
+          "accuracy": 0.3050000071525574,
+          "n_samples": 50
+        },
+        {
+          "client_id": "factory_c_inspect",
+          "task_type": "inspection",
+          "loss": 3.1115024089813232,
+          "accuracy": 0.28999999165534973,
+          "n_samples": 50
+        }
+      ]
+    }
+  ],
+  "final_global_accuracy": 0.06833333397905032
+}

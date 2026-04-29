@@ -37,6 +37,8 @@ pub enum TaskType {
     Assembly,       // 装配任务
     Inspection,     // 质量检测
     Manipulation,   // 物体操作
+    DataCollection, // VLA 数据采集
+    VLATraining,    // VLA 模型训练
     Custom(String), // 自定义任务
 }
 

@@ -8,6 +8,7 @@ use std::path::Path;
 pub struct HnswIndex {
     index: hnsw::Hnsw<f32, space::Euclidean>,
     dimension: usize,
+    max_elements: usize,
     ids: Vec<String>,
 }
 
@@ -23,6 +24,7 @@ impl HnswIndex {
         Self {
             index,
             dimension,
+            max_elements,
             ids: Vec::with_capacity(max_elements),
         }
     }
@@ -33,6 +35,9 @@ impl HnswIndex {
 
     pub fn insert(&mut self, id: &str, vector: &[f32]) -> Result<()> {
         assert_eq!(vector.len(), self.dimension, "Vector dimension mismatch");
+        if self.ids.len() >= self.max_elements {
+            anyhow::bail!("HNSW index full: {} / {} elements", self.ids.len(), self.max_elements);
+        }
         self.ids.push(id.to_string());
         self.index.insert(vector.to_vec());
         Ok(())

@@ -1,0 +1,171 @@
+{
+  "config": {
+    "n_classes": 10,
+    "img_size": 64,
+    "n_clients": 5,
+    "n_images": 40,
+    "max_obj": 3,
+    "difficulty": 0.0,
+    "seed": 42,
+    "backbone_channels": 32,
+    "rounds": 4,
+    "local_epochs": 1,
+    "lr": 0.005,
+    "batch_size": 32,
+    "alpha_sim": 0.4,
+    "alpha_perf": 0.3,
+    "alpha_size": 0.3,
+    "device": "cpu",
+    "results_dir": "results/quick"
+  },
+  "results": {
+    "fedavg": [
+      {
+        "round": 1,
+        "ap": 0.0,
+        "loss": 4.033218574523926,
+        "per_client_ap": {
+          "client_0": 0.0,
+          "client_1": 0.0,
+          "client_2": 0.0,
+          "client_3": 0.0,
+          "client_4": 0.0
+        },
+        "comm_bytes": 10769404,
+        "time": 2.8477485179901123,
+        "client_weights": null
+      },
+      {
+        "round": 2,
+        "ap": 0.0,
+        "loss": 8.466976976394653,
+        "per_client_ap": {
+          "client_0": 0.0,
+          "client_1": 0.0,
+          "client_2": 0.0,
+          "client_3": 0.0,
+          "client_4": 0.0
+        },
+        "comm_bytes": 10769404,
+        "time": 0.930448055267334,
+        "client_weights": null
+      },
+      {
+        "round": 3,
+        "ap": 0.0,
+        "loss": 7.135763835906983,
+        "per_client_ap": {
+          "client_0": 0.0,
+          "client_1": 0.0,
+          "client_2": 0.0,
+          "client_3": 0.0,
+          "client_4": 0.0
+        },
+        "comm_bytes": 10769404,
+        "time": 0.9230208396911621,
+        "client_weights": null
+      },
+      {
+        "round": 4,
+        "ap": 0.0,
+        "loss": 7.448900318145752,
+        "per_client_ap": {
+          "client_0": 0.0,
+          "client_1": 0.0,
+          "client_2": 0.0,
+          "client_3": 0.0,
+          "client_4": 0.0
+        },
+        "comm_bytes": 10769404,
+        "time": 0.9504275321960449,
+        "client_weights": null
+      }
+    ],
+    "ours": [
+      {
+        "round": 1,
+        "ap": 0.0,
+        "loss": 4.078284454345703,
+        "per_client_ap": {
+          "client_0": 0.0,
+          "client_1": 0.0,
+          "client_2": 0.0,
+          "client_3": 0.0,
+          "client_4": 0.0
+        },
+        "comm_bytes": 10769404,
+        "time": 0.9779093265533447,
+        "client_weights": [
+          0.32190099885641094,
+          0.11859239126310506,
+          0.31559647511038047,
+          0.12362539114692778,
+          0.12028474362317579
+        ]
+      },
+      {
+        "round": 2,
+        "ap": 0.0,
+        "loss": 9.014113330841065,
+        "per_client_ap": {
+          "client_0": 0.0,
+          "client_1": 0.0,
+          "client_2": 0.0,
+          "client_3": 0.0,
+          "client_4": 0.0
+        },
+        "comm_bytes": 10769404,
+        "time": 0.9180746078491211,
+        "client_weights": [
+          0.3121243692637065,
+          0.1368020286689288,
+          0.32385130739482915,
+          0.11936457966709688,
+          0.1078577150054387
+        ]
+      },
+      {
+        "round": 3,
+        "ap": 0.0,
+        "loss": 3.936583232879639,
+        "per_client_ap": {
+          "client_0": 0.0,
+          "client_1": 0.031746031746031744,
+          "client_2": 0.0,
+          "client_3": 0.0,
+          "client_4": 0.0
+        },
+        "comm_bytes": 10769404,
+        "time": 0.9263355731964111,
+        "client_weights": [
+          0.3038561765597253,
+          0.14630624375064707,
+          0.2862435781489835,
+          0.13509174024253984,
+          0.1285022612981043
+        ]
+      },
+      {
+        "round": 4,
+        "ap": 0.01485344588385209,
+        "loss": 7.500494265556336,
+        "per_client_ap": {
+          "client_0": 0.0,
+          "client_1": 0.011111111111111112,
+          "client_2": 0.0,
+          "client_3": 0.0,
+          "client_4": 0.0
+        },
+        "comm_bytes": 10769404,
+        "time": 0.9354195594787598,
+        "client_weights": [
+          0.34854601377000144,
+          0.08683362787916314,
+          0.2900441974831202,
+          0.13857457985777102,
+          0.13600158100994414
+        ]
+      }
+    ]
+  }
+}

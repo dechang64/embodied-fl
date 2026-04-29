@@ -1,10 +1,11 @@
 use std::sync::Arc;
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Json,
     Router,
     routing::get,
+    middleware,
 };
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -22,6 +23,7 @@ pub struct ApiState {
     pub contribution: Arc<ContributionTracker>,
     pub vector_db: Arc<std::sync::RwLock<VectorDb>>,
     pub audit: Arc<AuditChain>,
+    pub api_key: String,
 }
 
 #[derive(Serialize)]
@@ -35,8 +37,25 @@ struct ListQuery {
 }
 
 pub fn create_router(state: ApiState) -> Router {
+    let api_key = state.api_key.clone();
     Router::new()
         .route("/api/v1/health", get(health))
+        .route_layer(middleware::from_fn(move |headers: HeaderMap, req: axum::extract::Request, next: middleware::Next| {
+            let auth_required = !req.uri().path().ends_with("/health");
+            if auth_required {
+                let provided = headers.get("Authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.strip_prefix("Bearer "));
+                match provided {
+                    Some(key) if key == api_key => {}
+                    _ => return std::future::ready(Err((
+                        StatusCode::UNAUTHORIZED,
+                        Json(ApiError { error: "Invalid or missing API key".into() }),
+                    ))),
+                }
+            }
+            next.run(req)
+        }))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/tasks", get(list_tasks))
         .route("/api/v1/tasks/{task_id}", get(get_task))

@@ -61,6 +61,18 @@ service MonitorService {
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 }
 
+// VLA 数据采集服务 — Vision-Language-Action 数据管理
+service VLADataService {
+  // 上传 VLA episode 数据
+  rpc UploadEpisode(VLAEpisodeUpload) returns (VLAEpisodeResponse);
+  // 批量上传 episodes
+  rpc UploadEpisodeBatch(VLAEpisodeBatchUpload) returns (VLAEpisodeBatchResponse);
+  // 查询 episode 数据
+  rpc QueryEpisodes(VLAEpisodeQuery) returns (VLAEpisodeQueryResponse);
+  // 获取数据集统计
+  rpc GetDatasetStats(VLADatasetStatsRequest) returns (VLADatasetStatsResponse);
+}
+
 // ============================================================
 // 消息定义
 // ============================================================
@@ -331,4 +343,127 @@ message HealthCheckResponse {
   int64 uptime_seconds = 3;
   int32 active_connections = 4;
   string message = 5;
+}
+
+// ============================================================
+// VLA (Vision-Language-Action) 消息定义
+// ============================================================
+
+// --- VLA 数据上传 ---
+
+message VLAStep {
+  // Observation
+  bytes image = 1;                      // RGB image (JPEG/PNG bytes)
+  bytes depth = 2;                      // Depth image (optional)
+  repeated float robot_state = 3;       // Joint angles (rad)
+  float gripper = 4;                    // Gripper aperture (0=closed, 1=open)
+  repeated float end_effector_pose = 5; // [x, y, z, rx, ry, rz] (optional)
+  // Instruction
+  string instruction = 6;               // Language instruction
+  repeated float instruction_embedding = 7; // Pre-computed instruction embedding
+  // Action
+  repeated float target_joint_pos = 8;  // Target joint angles
+  float gripper_command = 9;            // Gripper target
+  repeated float delta_pose = 10;       // Relative pose delta (optional)
+  // Metadata
+  float reward = 11;
+  bool is_terminal = 12;
+  bool is_success = 13;
+  int64 timestamp = 14;
+}
+
+message VLAEpisodeUpload {
+  string episode_id = 1;
+  string client_id = 2;
+  string robot_type = 3;                // e.g., "franka_panda", "ur5e"
+  string task_type = 4;                 // e.g., "grasping", "assembly"
+  repeated VLAStep steps = 5;
+  map<string, string> metadata = 6;
+}
+
+message VLAEpisodeResponse {
+  bool accepted = 1;
+  string episode_id = 2;
+  int32 num_steps_stored = 3;
+  string message = 4;
+}
+
+message VLAEpisodeBatchUpload {
+  string client_id = 1;
+  repeated VLAEpisodeUpload episodes = 2;
+}
+
+message VLAEpisodeBatchResponse {
+  int32 accepted = 1;
+  int32 rejected = 2;
+  repeated string episode_ids = 3;
+  string message = 4;
+}
+
+// --- VLA 数据查询 ---
+
+message VLAEpisodeQuery {
+  string client_id = 1;                 // Filter by client
+  string task_type = 2;                 // Filter by task type
+  string robot_type = 3;                // Filter by robot type
+  int32 limit = 4;                      // Max episodes to return
+  int32 offset = 5;                     // Pagination offset
+  bool success_only = 6;                // Only successful episodes
+}
+
+message VLAEpisodeQueryResponse {
+  repeated VLAEpisodeSummary episodes = 1;
+  int32 total = 2;
+}
+
+message VLAEpisodeSummary {
+  string episode_id = 1;
+  string client_id = 2;
+  string task_type = 3;
+  string robot_type = 4;
+  int32 num_steps = 5;
+  float avg_reward = 6;
+  bool is_success = 7;
+  string instruction = 8;               // First instruction in episode
+  int64 created_at = 9;
+}
+
+// --- VLA 数据集统计 ---
+
+message VLADatasetStatsRequest {
+  string client_id = 1;                 // Filter by client (empty = all)
+}
+
+message VLADatasetStatsResponse {
+  int32 total_episodes = 1;
+  int32 total_steps = 2;
+  int32 successful_episodes = 3;
+  float avg_reward = 4;
+  float avg_steps_per_episode = 5;
+  map<string, int32> episodes_by_task_type = 6;
+  map<string, int32> episodes_by_robot_type = 7;
+  map<string, int32> steps_by_client = 8;
+}
+
+// --- VLA 模型更新（扩展 UpdateRequest） ---
+
+message VLAUpdateRequest {
+  string client_id = 1;
+  bytes vision_projector_params = 2;    // DINOv2 → d_model projection
+  bytes fusion_params = 3;              // Cross-attention fusion layers
+  bytes action_head_params = 4;         // Action prediction head (optional)
+  int32 num_episodes_trained = 5;
+  int32 num_local_epochs = 6;
+  float local_loss = 7;
+  float action_accuracy = 8;            // Token prediction accuracy
+  repeated float task_embedding = 9;    // Instruction embedding for task matching
+  map<string, float> metrics = 10;
+}
+
+message VLAUpdateResponse {
+  bool accepted = 1;
+  string message = 2;
+  float contribution_score = 3;
+  float total_contribution = 4;
+  int32 global_episode_count = 5;       // Updated total episode count
 }

@@ -41,6 +41,8 @@ impl EmbodiedFlService {
 
     pub fn into_federated_server(self) -> FederatedServiceServer<Self> {
         FederatedServiceServer::new(self)
+            .max_decoding_message_size(64 * 1024 * 1024)
+            .timeout(std::time::Duration::from_secs(30))
     }
 }
 

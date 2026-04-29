@@ -13,6 +13,7 @@ synthetic dataset with COCO/VOC and the CNN backbone with YOLOv8.
 """
 
 import os, json, time, copy
+from pathlib import Path
 import numpy as np
 from dataclasses import dataclass
 from typing import List, Dict, Tuple
@@ -450,7 +451,7 @@ def main():
     print(f"  Ours   best AP:   {ours_best:.4f}")
 
     # ── Save ──
-    results_dir = '/home/z/my-project/download/embodied-fl/experiments/yolo_fed/results'
+    results_dir = Path(__file__).parent / 'results'
     os.makedirs(results_dir, exist_ok=True)
 
     output = {

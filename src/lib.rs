@@ -7,3 +7,5 @@ pub mod hnsw_index;
 pub mod grpc_service;
 pub mod rest_api;
 pub mod web_dashboard;
+pub mod task_embedding;
+pub mod vla_service;

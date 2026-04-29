@@ -81,26 +81,41 @@ impl AuditChain {
     }
 
     /// 获取最近审计记录
-    pub fn get_recent(&self, limit: i64, operation_type: Option<&str>) -> Result<Vec<AuditEntry>> {
+    pub fn get_recent(
+        &self, limit: i64, operation_type: Option<&str>) -> Result<Vec<AuditEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut sql = "SELECT id, timestamp, operation, client_id, details, hash, prev_hash FROM audit_log".to_string();
-        if let Some(op) = operation_type {
-            sql.push_str(&format!(" WHERE operation = '{}'", op));
+        if operation_type.is_some() {
+            sql.push_str(" WHERE operation = ?1");
         }
-        sql.push_str(&format!(" ORDER BY id DESC LIMIT {}", limit));
+        sql.push_str(" ORDER BY id DESC LIMIT ?2");
 
         let mut stmt = conn.prepare(&sql)?;
-        let entries = stmt.query_map([], |row| {
-            Ok(AuditEntry {
-                index: row.get(0)?,
-                timestamp: row.get(1)?,
-                operation: row.get(2)?,
-                client_id: row.get(3)?,
-                details: row.get(4)?,
-                hash: row.get(5)?,
-                prev_hash: row.get(6)?,
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let entries = if let Some(op) = operation_type {
+            stmt.query_map(rusqlite::params![op, limit], |row| {
+                Ok(AuditEntry {
+                    index: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    operation: row.get(2)?,
+                    client_id: row.get(3)?,
+                    details: row.get(4)?,
+                    hash: row.get(5)?,
+                    prev_hash: row.get(6)?,
+                })
+            })?.collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map(rusqlite::params![limit], |row| {
+                Ok(AuditEntry {
+                    index: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    operation: row.get(2)?,
+                    client_id: row.get(3)?,
+                    details: row.get(4)?,
+                    hash: row.get(5)?,
+                    prev_hash: row.get(6)?,
+                })
+            })?.collect::<Result<Vec<_>, _>>()?
+        };
 
         entries.reverse();
         Ok(entries)

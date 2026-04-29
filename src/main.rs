@@ -11,6 +11,7 @@ mod hnsw_index;
 mod grpc_service;
 mod rest_api;
 mod web_dashboard;
+mod task_embedding;
 
 use task_registry::TaskRegistry;
 use fed_server::FedServer;
@@ -30,29 +31,33 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     info!("╔══════════════════════════════════════════════════╗");
-    info!("║   Embodied-FL v0.1.0                             ║");
+    info!("║   Embodied-FL v2.0.0                            ║");
     info!("║   Federated Learning for Embodied Intelligence   ║");
+    info!("║   + YOLOv11 + DINOv2 + Multi-Task FL            ║");
     info!("╚══════════════════════════════════════════════════╝");
 
-    // 初始化各组件
+    // Initialize components
     let task_registry = Arc::new(TaskRegistry::new(std::path::Path::new("data/tasks.db"))?);
     info!("TaskRegistry initialized");
 
-    let fed_server = Arc::new(FedServer::new(std::path::Path::new("data/fed.db"))?);
-    info!("FedServer initialized");
+    let fed_server = Arc::new(FedServer::new(
+        Arc::clone(&task_registry),
+        Arc::clone(&task_registry),
+        Arc::clone(&task_registry),
+    ));
+    info!("FedServer initialized (Task-Aware aggregation)");
 
-    let contribution = Arc::new(ContributionTracker::new(std::path::Path::new("data/contribution.db"))?);
+    let contribution = Arc::new(ContributionTracker::new(std::path::Path::new("data/contributions.db"))?);
     info!("ContributionTracker initialized");
 
     let vector_db = Arc::new(std::sync::RwLock::new(VectorDb::new(32)));
-    info!("VectorDB initialized (dimension=32)");
+    info!("VectorDB initialized (HNSW, dim=32)");
 
     let audit = Arc::new(AuditChain::new(std::path::Path::new("data/audit.db"))?);
-    info!("AuditChain initialized");
+    info!("AuditChain initialized (SHA-256)");
 
-    audit.append("system_start", "Embodied-FL v0.1.0 started")?;
+    let api_key = std::env::var("EMBODIED_FL_API_KEY").unwrap_or_else(|_| "dev-key".to_string());
 
-    // gRPC 服务
     let grpc_service = EmbodiedFlService::new(
         Arc::clone(&task_registry),
         Arc::clone(&fed_server),
@@ -61,13 +66,13 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&audit),
     );
 
-    // REST API
     let api_state = ApiState {
         task_registry: Arc::clone(&task_registry),
         fed_server: Arc::clone(&fed_server),
         contribution: Arc::clone(&contribution),
         vector_db: Arc::clone(&vector_db),
         audit: Arc::clone(&audit),
+        api_key,
     };
 
     // gRPC:50051
