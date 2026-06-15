@@ -1,4 +1,3 @@
-# rebuild trigger
 # ── streamlit_app.py ──
 """
 Embodied-FL: Vision-Language-Action Federated Learning Dashboard
@@ -26,8 +25,10 @@ import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# Ensure analysis modules are importable
-# python/ path removed: root analysis/ and utils/ are standalone (no twc_core dependency)
+# Ensure analysis modules are importable from repo root
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 from analysis.vla_model import VLAFLModel, VLAFLTrainer, VLAConfig
 from analysis.action_tokenizer import ActionTokenizer, DeltaActionTokenizer, TokenizerConfig
