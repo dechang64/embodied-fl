@@ -26,7 +26,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # Ensure analysis modules are importable
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "python"))
+# python/ path removed: root analysis/ and utils/ are standalone (no twc_core dependency)
 
 from analysis.vla_model import VLAFLModel, VLAFLTrainer, VLAConfig
 from analysis.action_tokenizer import ActionTokenizer, DeltaActionTokenizer, TokenizerConfig
