@@ -15,6 +15,9 @@ Features:
 
 import sys
 import os
+import json
+import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -30,8 +33,12 @@ from analysis.action_tokenizer import ActionTokenizer, DeltaActionTokenizer, Tok
 from analysis.instruction_parser import InstructionParser
 from analysis.instruction_embedding import InstructionEmbedder, EmbeddingConfig
 from analysis.multi_task_fl import EmbodiedMultiTaskFL
+from analysis.feature_extractor import MetadataFallbackExtractor
+from analysis.detector import RobotSceneDetector, Detection
 from analysis.gradcam import GradCAM, generate_robot_explanation
-from utils.constants import FACTORY_PRESETS
+from analysis.vla_collector import SyntheticCollector, compute_episode_statistics
+from analysis.vla_dataset import VLADataset, VLASample
+from utils.constants import FACTORY_PRESETS, COLORS
 
 # ── Page Config ──
 st.set_page_config(
@@ -196,11 +203,8 @@ with st.sidebar:
 
 
 # ── Helper Functions ──
-def render_metric_row(metrics: list[tuple[str, str, str | float | None]]):
-    """Render a row of metric cards.
-
-    delta must be a number or None (st.metric requirement).
-    """
+def render_metric_row(metrics: list[tuple[str, str, str]]):
+    """Render a row of metric cards."""
     cols = st.columns(len(metrics))
     for col, (label, value, delta) in zip(cols, metrics):
         with col:
@@ -439,17 +443,13 @@ with tab1:
 
         progress_text.text("Aggregating via FedAvg...")
 
-        # FedAvg aggregation (sample-weighted)
+        # FedAvg aggregation
         all_shared = [c.model.get_shared_state_dict() for c in clients]
-        client_data_sizes = [N] * len(clients)  # demo: equal sizes
-        total_samples = sum(client_data_sizes)
         shared_params = {}
         for key in all_shared[0]:
-            weighted = sum(
-                s[key] * (client_data_sizes[i] / total_samples)
-                for i, s in enumerate(all_shared)
-            )
-            shared_params[key] = weighted
+            shared_params[key] = torch.stack(
+                [s[key] for s in all_shared]
+            ).mean(dim=0)
 
         # Load into global model
         global_model = VLAFLModel(config)
@@ -598,9 +598,9 @@ with tab2:
         final = history[-1]
         render_metric_row([
             ("Final Val Accuracy", f"{final['val_acc']:.1%}",
-             final['val_acc'] - history[0]['val_acc']),
+             f"{final['val_acc'] - history[0]['val_acc']:.1%}"),
             ("Final Val Loss", f"{final['val_loss']:.4f}",
-             final['val_loss'] - history[0]['val_loss']),
+             f"{final['val_loss'] - history[0]['val_loss']:.4f}"),
             ("Total Rounds", str(mt_rounds), None),
             ("Total Time", f"{final['elapsed']:.1f}s", None),
         ])
