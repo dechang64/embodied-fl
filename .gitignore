@@ -1,0 +1,39 @@
+
+# Data & generated
+# Environment
+# Experiments
+# IDE
+# Model weights & checkpoints
+# OS
+# Python
+# Rust
+**/*.rs.bk
+*.bin
+*.ckpt
+*.egg-info
+*.egg-info/
+*.h5
+*.npz
+*.pkl
+*.pt
+*.pth
+*.pyc
+*.pyo
+*.safetensors
+*.swo
+*.swp
+.DS_Store
+.env
+.idea/
+.venv/
+.vscode/
+/target/
+Cargo.lock
+Thumbs.db
+__pycache__/
+build/
+dist/
+experiments/**/results/
+experiments/results/
+python/proto/
+venv/
