@@ -1,3 +1,4 @@
+# rebuild trigger
 # ── streamlit_app.py ──
 """
 Embodied-FL: Vision-Language-Action Federated Learning Dashboard
