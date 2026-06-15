@@ -24,7 +24,6 @@ import torch.nn as nn
 from PIL import Image
 from pathlib import Path
 from typing import Optional
-from torchvision import transforms
 
 
 class DINOv2SceneExtractor(nn.Module):
@@ -48,6 +47,7 @@ class DINOv2SceneExtractor(nn.Module):
         self.backbone = AutoModel.from_pretrained(model_name)
         self.backbone.to(self.device).eval()
 
+        from torchvision import transforms
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
