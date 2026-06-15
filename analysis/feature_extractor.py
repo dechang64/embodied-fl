@@ -1,4 +1,3 @@
-from __future__ import annotations
 # ── python/analysis/feature_extractor.py ──
 """
 DINOv2 Scene Feature Extractor for Embodied Intelligence

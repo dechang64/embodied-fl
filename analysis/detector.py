@@ -1,4 +1,3 @@
-from __future__ import annotations
 # ── python/analysis/detector.py ──
 """
 YOLOv11 Robot Scene Detector

@@ -1,4 +1,3 @@
-from __future__ import annotations
 # ── python/utils/constants.py ──
 """Shared constants for Embodied-FL Python modules."""
 
