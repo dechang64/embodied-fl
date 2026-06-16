@@ -144,24 +144,28 @@ st.markdown(f"""
         color: var(--muted) !important;
         font-size: 0.85rem !important;
     }}
-    /* Sidebar: use Streamlit default light bg, force dark text */
-    div[data-testid="stSidebar"] {{
-        background: #f8f9fa !important;
-    }}
+    /* Sidebar: force light bg + dark text (Streamlit Cloud overrides CSS) */
+    section[data-testid="stSidebar"],
     div[data-testid="stSidebar"],
-    div[data-testid="stSidebar"] *:not(svg):not(path) {{
+    div[data-testid="stSidebar"] > div,
+    div[data-testid="stSidebar"] > div > div {{
+        background: #f0f2f6 !important;
+    }}
+    section[data-testid="stSidebar"] *,
+    div[data-testid="stSidebar"] * {{
         color: #1e293b !important;
     }}
     div[data-testid="stSidebar"] label,
-    div[data-testid="stSidebar"] .stCaption {{
-        color: #64748b !important;
+    div[data-testid="stSidebar"] .stCaption,
+    div[data-testid="stSidebar"] p {{
+        color: #334155 !important;
     }}
     div[data-testid="stSidebar"] .stInfo {{
         background: rgba(56,189,248,0.08) !important;
         color: #1e293b !important;
     }}
     div[data-testid="stSidebar"] a {{
-        color: {PRIMARY} !important;
+        color: #0284c7 !important;
     }}
 </style>
 """, unsafe_allow_html=True)
@@ -205,7 +209,7 @@ with st.sidebar:
 
     st.divider()
     st.markdown("""
-    <div style='text-align:center; color:{TEXT_MUTED}; font-size:0.75rem;'>
+    <div style='text-align:center; color:#64748b; font-size:0.75rem;'>
     Embodied-FL v2.0 · VLA Upgrade<br>
     Rust Backend + Python Analysis<br>
     © 2026
