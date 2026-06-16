@@ -144,20 +144,24 @@ st.markdown(f"""
         color: var(--muted) !important;
         font-size: 0.85rem !important;
     }}
-    /* Sidebar: dark bg + light text for all elements */
+    /* Sidebar: use Streamlit default light bg, force dark text */
     div[data-testid="stSidebar"] {{
-        background: {CARD_BG} !important;
+        background: #f8f9fa !important;
     }}
     div[data-testid="stSidebar"],
     div[data-testid="stSidebar"] *:not(svg):not(path) {{
-        color: var(--text) !important;
+        color: #1e293b !important;
     }}
     div[data-testid="stSidebar"] label,
     div[data-testid="stSidebar"] .stCaption {{
-        color: var(--muted) !important;
+        color: #64748b !important;
     }}
     div[data-testid="stSidebar"] .stInfo {{
-        background: rgba(56,189,248,0.1) !important;
+        background: rgba(56,189,248,0.08) !important;
+        color: #1e293b !important;
+    }}
+    div[data-testid="stSidebar"] a {{
+        color: {PRIMARY} !important;
     }}
 </style>
 """, unsafe_allow_html=True)
