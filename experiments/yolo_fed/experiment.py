@@ -14,7 +14,6 @@ Experiments:
   Exp4: Communication efficiency
   Exp5: Ablation on aggregation weights (α_sim, α_perf, α_size)
 """
-from __future__ import annotations
 
 import os
 import sys
@@ -23,7 +22,6 @@ import time
 import copy
 import argparse
 import numpy as np
-from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Tuple, Optional
 

@@ -144,31 +144,20 @@ st.markdown(f"""
         color: var(--muted) !important;
         font-size: 0.85rem !important;
     }}
-    /* Sidebar: force all text light on dark bg */
+    /* Sidebar: dark bg + light text for all elements */
     div[data-testid="stSidebar"] {{
-        background: {CARD_BG};
+        background: {CARD_BG} !important;
+    }}
+    div[data-testid="stSidebar"],
+    div[data-testid="stSidebar"] *:not(svg):not(path) {{
         color: var(--text) !important;
     }}
-    div[data-testid="stSidebar"] * {{
-        color: var(--text) !important;
-    }}
-    div[data-testid="stSidebar"] .stMarkdown {{
-        color: var(--text) !important;
-    }}
-    div[data-testid="stSidebar"] label {{
+    div[data-testid="stSidebar"] label,
+    div[data-testid="stSidebar"] .stCaption {{
         color: var(--muted) !important;
-    }}
-    div[data-testid="stSidebar"] input,
-    div[data-testid="stSidebar"] .stNumberInput input,
-    div[data-testid="stSidebar"] .stSlider {{
-        color: var(--text) !important;
     }}
     div[data-testid="stSidebar"] .stInfo {{
         background: rgba(56,189,248,0.1) !important;
-        color: var(--text) !important;
-    }}
-    div[data-testid="stSidebar"] button {{
-        color: var(--text) !important;
     }}
 </style>
 """, unsafe_allow_html=True)

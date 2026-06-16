@@ -27,11 +27,9 @@ Output:
   results/fig1-fig9.png             — Publication-quality figures
 """
 
-import os, sys, json, time, copy, argparse, math
+import os, json, time, copy, argparse
 import numpy as np
-from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional
-from copy import deepcopy
+from dataclasses import dataclass
 
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 

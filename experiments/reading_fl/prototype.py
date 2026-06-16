@@ -8,15 +8,14 @@
 
 核心改进：情感标签由文本内容决定（非随机），确保模型可学到 80%+
 """
-from __future__ import annotations
 
 import json
 import time
 import random
 import numpy as np
 from collections import Counter
-from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Tuple
+from dataclasses import dataclass, field
+from typing import List, Dict
 
 random.seed(42)
 np.random.seed(42)

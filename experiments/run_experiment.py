@@ -14,8 +14,6 @@ Exp6: Gradient compression (Top-K + Quantization)
 import numpy as np
 import json, os, time
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
-from copy import deepcopy
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -1,11 +1,33 @@
-# ── python/analysis/__init__.py ──
-from .detector import RobotSceneDetector
-from .feature_extractor import DINOv2SceneExtractor, MetadataFallbackExtractor, get_extractor
-from .gradcam import GradCAM, generate_robot_explanation
-from .multi_task_fl import EmbodiedMultiTaskFL
-from .vla_collector import BaseCollector, SyntheticCollector, ROS2BagCollector, IsaacSimCollector, JSONLogCollector, Episode, Step, Observation, Action
-from .vla_dataset import VLADataset, VLASample
-from .action_tokenizer import ActionTokenizer, DeltaActionTokenizer, TokenizerConfig
-from .instruction_parser import InstructionParser, ParsedInstruction
-from .instruction_embedding import InstructionEmbedder, EmbeddingConfig
-from .vla_model import VLAFLModel, VLAFLTrainer, VLAConfig
+# ── analysis/__init__.py ──
+# Lazy imports to avoid requiring heavy deps (ultralytics, transformers, torchvision)
+# at module load time. Each module is imported only when accessed.
+
+def __getattr__(name):
+    _lazy = {
+        'RobotSceneDetector': '.detector',
+        'Detection': '.detector',
+        'DINOv2SceneExtractor': '.feature_extractor',
+        'MetadataFallbackExtractor': '.feature_extractor',
+        'get_extractor': '.feature_extractor',
+        'GradCAM': '.gradcam',
+        'generate_robot_explanation': '.gradcam',
+        'EmbodiedMultiTaskFL': '.multi_task_fl',
+        'VLAFLModel': '.vla_model',
+        'VLAFLTrainer': '.vla_model',
+        'VLAConfig': '.vla_model',
+        'ActionTokenizer': '.action_tokenizer',
+        'DeltaActionTokenizer': '.action_tokenizer',
+        'TokenizerConfig': '.action_tokenizer',
+        'InstructionParser': '.instruction_parser',
+        'InstructionEmbedder': '.instruction_embedding',
+        'EmbeddingConfig': '.instruction_embedding',
+        'SyntheticCollector': '.vla_collector',
+        'compute_episode_statistics': '.vla_collector',
+        'VLADataset': '.vla_dataset',
+        'VLASample': '.vla_dataset',
+    }
+    if name in _lazy:
+        import importlib
+        mod = importlib.import_module(_lazy[name], __name__)
+        return getattr(mod, name)
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')

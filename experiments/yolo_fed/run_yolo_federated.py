@@ -13,24 +13,19 @@ Experiments:
   Exp2: Backbone-only vs Full-model aggregation
   Exp3: Scalability (10 clients)
 """
-from __future__ import annotations
 
 import os
 import json
 import time
-import copy
 import tempfile
 import numpy as np
 from pathlib import Path
-from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, Subset
-from torchvision import transforms
+from torch.utils.data import Dataset
 from PIL import Image
 
 from ultralytics import YOLO

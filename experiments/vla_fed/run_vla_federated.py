@@ -1,4 +1,3 @@
-from __future__ import annotations
 # ── experiments/vla_fed/run_vla_federated.py ──
 """
 VLA Federated Learning — End-to-End Integration Experiment
@@ -25,7 +24,6 @@ import json
 import time
 import argparse
 import numpy as np
-from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Tuple
 
