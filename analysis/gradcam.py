@@ -11,12 +11,12 @@ Why this matters for embodied AI:
 - Compliance: Safety audits require interpretable AI decisions
 """
 
+from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
-from typing import Optional, Tuple
+from typing import Optional
 
 
 class GradCAM:

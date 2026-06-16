@@ -21,9 +21,10 @@ Bridge to Rust:
   → Rust stores in HNSW → TaskMatcher finds similar tasks
 """
 
+from __future__ import annotations
 import numpy as np
 import hashlib
-from typing import Optional, Union
+from typing import Optional
 from dataclasses import dataclass
 
 

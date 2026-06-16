@@ -16,8 +16,8 @@ Federated Learning Integration:
 - Task-Aware weighting based on task similarity
 """
 
+from __future__ import annotations
 import numpy as np
-from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass, asdict
 

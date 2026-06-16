@@ -13,11 +13,10 @@ Features:
   - Architecture overview
 """
 
+from __future__ import annotations
 import sys
 import os
 import json
-import time
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -35,12 +34,10 @@ from analysis.action_tokenizer import ActionTokenizer, DeltaActionTokenizer, Tok
 from analysis.instruction_parser import InstructionParser
 from analysis.instruction_embedding import InstructionEmbedder, EmbeddingConfig
 from analysis.multi_task_fl import EmbodiedMultiTaskFL
-from analysis.feature_extractor import MetadataFallbackExtractor
-from analysis.detector import RobotSceneDetector, Detection
 from analysis.gradcam import GradCAM, generate_robot_explanation
-from analysis.vla_collector import SyntheticCollector, compute_episode_statistics
+from analysis.vla_collector import SyntheticCollector
 from analysis.vla_dataset import VLADataset, VLASample
-from utils.constants import FACTORY_PRESETS, COLORS
+from utils.constants import FACTORY_PRESETS
 
 # ── Page Config ──
 st.set_page_config(
@@ -464,13 +461,20 @@ with tab1:
 
         progress_text.text("Aggregating via FedAvg...")
 
-        # FedAvg aggregation
+        # FedAvg aggregation (sample-weighted)
+        if not clients:
+            raise ValueError("No clients to aggregate")
         all_shared = [c.model.get_shared_state_dict() for c in clients]
+        client_sizes = [c.n_samples for c in clients]
+        total = sum(client_sizes)
+        if total == 0:
+            raise ValueError("Total client samples is zero")
         shared_params = {}
         for key in all_shared[0]:
-            shared_params[key] = torch.stack(
-                [s[key] for s in all_shared]
-            ).mean(dim=0)
+            shared_params[key] = sum(
+                s[key] * (sz / total)
+                for s, sz in zip(all_shared, client_sizes)
+            )
 
         # Load into global model
         global_model = VLAFLModel(config)

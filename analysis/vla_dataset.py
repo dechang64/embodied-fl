@@ -23,6 +23,7 @@ Federated Learning Integration:
   - Task matching via HNSW on instruction embeddings
 """
 
+from __future__ import annotations
 import json
 import os
 import hashlib

@@ -18,11 +18,11 @@ Bridge to Rust:
   → Rust stores in HNSW index for task matching
 """
 
+from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
-from pathlib import Path
 from typing import Optional
 
 

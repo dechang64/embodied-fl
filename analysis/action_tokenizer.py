@@ -19,6 +19,7 @@ Federated Learning Integration:
   - Different robots can have different action_dim but same tokenizer config
 """
 
+from __future__ import annotations
 import numpy as np
 from typing import Optional
 from dataclasses import dataclass, field

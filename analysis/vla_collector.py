@@ -49,6 +49,7 @@ Bridge to Rust:
   Collected episodes → serialized → gRPC UploadEpisode → Rust stores + indexes
 """
 
+from __future__ import annotations
 import json
 import os
 import time
@@ -56,7 +57,7 @@ import hashlib
 import base64
 import numpy as np
 from pathlib import Path
-from typing import Optional, Union, Iterator
+from typing import Optional, Union
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 

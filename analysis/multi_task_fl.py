@@ -17,6 +17,7 @@ Architecture:
     4. Task-Aware weighting via HNSW similarity
 """
 
+from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
@@ -154,10 +155,19 @@ class EmbodiedMultiTaskFL:
         return total_loss / max(total, 1), correct / max(total, 1)
 
     @staticmethod
-    def _fedavg(params_list: list[OrderedDict]) -> OrderedDict:
+    def _fedavg(params_list: list[OrderedDict], client_data_sizes: list[int] | None = None) -> OrderedDict:
+        if not params_list:
+            raise ValueError("params_list is empty, cannot aggregate")
         avg = OrderedDict()
-        for key in params_list[0]:
-            avg[key] = torch.stack([p[key] for p in params_list]).mean(dim=0)
+        if client_data_sizes is not None and len(client_data_sizes) == len(params_list):
+            total = sum(client_data_sizes)
+            if total == 0:
+                raise ValueError("Total client data size is zero")
+            for key in params_list[0]:
+                avg[key] = sum(p[key] * (sz / total) for p, sz in zip(params_list, client_data_sizes))
+        else:
+            for key in params_list[0]:
+                avg[key] = torch.stack([p[key] for p in params_list]).mean(dim=0)
         return avg
 
     def run(

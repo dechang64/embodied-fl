@@ -18,6 +18,7 @@ Federated Learning Integration:
   - Shared parser across all clients ensures consistent task understanding
 """
 
+from __future__ import annotations
 import re
 import hashlib
 from typing import Optional
