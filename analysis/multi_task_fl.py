@@ -84,6 +84,8 @@ class EmbodiedMultiTaskFL:
         n_clients: int,
         val_split: float = 0.2,
     ) -> tuple:
+        if n_clients <= 0:
+            raise ValueError("n_clients must be positive")
         rng = np.random.RandomState(self.seed)
         n = len(features)
         indices = rng.permutation(n)
@@ -126,6 +128,7 @@ class EmbodiedMultiTaskFL:
                 out = client_model(xb)
                 loss = criterion(out, yb)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(client_model.parameters(), max_norm=1.0)
                 optimizer.step()
                 total_loss += loss.item() * len(xb)
                 correct += (out.argmax(1) == yb).sum().item()
@@ -156,18 +159,61 @@ class EmbodiedMultiTaskFL:
 
     @staticmethod
     def _fedavg(params_list: list[OrderedDict], client_data_sizes: list[int] | None = None) -> OrderedDict:
+        """FedAvg aggregation with optional sample-weighted averaging.
+
+        FedCtx integration: when unified-fl-backend is available, delegates
+        aggregation to the Rust server (supports FedAvg/FedProx/EWA + DP).
+        Falls back to local Python FedAvg when FedCtx is unavailable.
+
+        Args:
+            params_list: List of client model state dicts.
+            client_data_sizes: Optional list of sample counts per client.
+                If provided, weights each client by n_k / N (standard FedAvg).
+                If None, falls back to simple average (equal weight).
+        """
         if not params_list:
-            raise ValueError("params_list is empty, cannot aggregate")
-        avg = OrderedDict()
+            raise ValueError("params_list is empty — cannot aggregate")
+
+        # Try FedCtx aggregation
+        try:
+            from core.grpc_client import get_fedctx_client
+            client = get_fedctx_client()
+            if client.available:
+                for i, params in enumerate(params_list):
+                    flat_params = torch.cat([p.flatten() for p in params.values()]).numpy()
+                    n_samples = client_data_sizes[i] if client_data_sizes else len(params)
+                    client.fl_submit_update(
+                        client_id=f"embodied_client_{i}",
+                        round_num=0,
+                        parameters=flat_params.tolist(),
+                        num_samples=n_samples,
+                    )
+                agg_resp = client.fl_aggregate(strategy="fedavg")
+                if agg_resp and agg_resp.get("parameters"):
+                    global_params = torch.tensor(agg_resp["parameters"], dtype=torch.float32)
+                    offset = 0
+                    avg = OrderedDict()
+                    for key in params_list[0].keys():
+                        shape = params_list[0][key].shape
+                        size = params_list[0][key].numel()
+                        avg[key] = global_params[offset:offset + size].reshape(shape)
+                        offset += size
+                    return avg
+        except (ImportError, Exception):
+            pass  # Fall through to local aggregation
+
+        # Local fallback: Python FedAvg
         if client_data_sizes is not None and len(client_data_sizes) == len(params_list):
             total = sum(client_data_sizes)
             if total == 0:
-                raise ValueError("Total client data size is zero")
-            for key in params_list[0]:
-                avg[key] = sum(p[key] * (sz / total) for p, sz in zip(params_list, client_data_sizes))
+                raise ValueError("Total client data size is zero — cannot aggregate")
+            weights = [n / total for n in client_data_sizes]
         else:
-            for key in params_list[0]:
-                avg[key] = torch.stack([p[key] for p in params_list]).mean(dim=0)
+            weights = [1.0 / len(params_list)] * len(params_list)
+
+        avg = OrderedDict()
+        for key in params_list[0]:
+            avg[key] = sum(w * p[key] for w, p in zip(weights, params_list))
         return avg
 
     def run(
@@ -219,8 +265,9 @@ class EmbodiedMultiTaskFL:
                     "n_samples": len(split_idx),
                 })
 
-            # FedAvg aggregation
-            global_cls_params = self._fedavg(client_params_list)
+            # FedAvg aggregation (sample-weighted)
+            client_sizes = [len(s) for s in client_splits]
+            global_cls_params = self._fedavg(client_params_list, client_data_sizes=client_sizes)
             self.classifier.load_state_dict(global_cls_params)
 
             val_loss, val_acc = self._evaluate(self.classifier, val_X_t, val_y_t, self.batch_size)
