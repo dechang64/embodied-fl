@@ -251,7 +251,7 @@ def plot_training_curves(history: list[dict], title: str = "Training Progress"):
     fig.update_layout(
         title=dict(text=title, font=dict(size=16, color=TEXT)),
         plot_bgcolor=CARD_BG,
-        paper_bgcolor="transparent",
+        paper_bgcolor="rgba(0,0,0,0)",
         font=dict(color=TEXT_MUTED, size=11),
         legend=dict(orientation="h", yanchor="bottom", y=1.12),
         height=350,
@@ -302,7 +302,7 @@ def plot_tokenizer_heatmap(tokenizer, actions: np.ndarray, title: str = "Action 
         title=dict(text=title, font=dict(size=14, color=TEXT)),
         barmode="group",
         plot_bgcolor=CARD_BG,
-        paper_bgcolor="transparent",
+        paper_bgcolor="rgba(0,0,0,0)",
         font=dict(color=TEXT_MUTED, size=11),
         height=350,
         legend=dict(orientation="h", yanchor="bottom", y=1.12),
@@ -348,7 +348,7 @@ def plot_embedding_similarity(embedder, instructions: list[str], query: str):
     fig.update_layout(
         title=f"Task Similarity to: \"{query}\"",
         plot_bgcolor=CARD_BG,
-        paper_bgcolor="transparent",
+        paper_bgcolor="rgba(0,0,0,0)",
         font=dict(color=TEXT_MUTED, size=11),
         height=max(300, len(instructions) * 40 + 80),
         margin=dict(t=60, b=20),
@@ -741,7 +741,7 @@ with tab3:
         fig.update_layout(
             title="Quantization Error Distribution",
             plot_bgcolor=CARD_BG,
-            paper_bgcolor="transparent",
+            paper_bgcolor="rgba(0,0,0,0)",
             font=dict(color=TEXT_MUTED, size=13),
             xaxis_title="Absolute Error",
             yaxis_title="Count",
@@ -855,7 +855,7 @@ with tab4:
             fig.update_layout(
                 title="Task Type Distribution",
                 plot_bgcolor=CARD_BG,
-                paper_bgcolor="transparent",
+                paper_bgcolor="rgba(0,0,0,0)",
                 font=dict(color=TEXT_MUTED, size=13),
                 height=400,
                 margin=dict(t=60, b=20),
@@ -926,7 +926,7 @@ with tab5:
             fig.update_layout(
                 title=f"Grad-CAM Heatmap ({img_size}×{img_size})",
                 plot_bgcolor=CARD_BG,
-                paper_bgcolor="transparent",
+                paper_bgcolor="rgba(0,0,0,0)",
                 font=dict(color=TEXT_MUTED, size=13),
                 height=400,
                 margin=dict(t=60, b=20),
