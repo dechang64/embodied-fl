@@ -37,3 +37,4 @@ experiments/**/results/
 experiments/results/
 python/proto/
 venv/
+.venv-test/

@@ -181,7 +181,14 @@ class EWC:
     def consolidate(self, X, y, n_samples=200):
         idx = np.random.choice(X.shape[0], min(n_samples, X.shape[0]), replace=False)
         Xs, ys = X[idx], y[idx]
-        self.fisher = [np.zeros_like(w) for w in self.model.W] + [np.zeros_like(b) for b in self.model.b]
+        # Fisher must be laid out INTERLEAVED as [fW0, fb0, fW1, fb1, ...] to
+        # match both the `2*j` / `2*j+1` indexing below and get_params().
+        # Building it blocked as [W...] + [b...] silently desynchronised the
+        # indices and raised a shape error on the first consolidate().
+        self.fisher = []
+        for w, b in zip(self.model.W, self.model.b):
+            self.fisher.append(np.zeros_like(w))
+            self.fisher.append(np.zeros_like(b))
         for i in range(Xs.shape[0]):
             p = self.model.forward(Xs[i:i+1]); d = (p - ys[i:i+1]) / Xs.shape[0]
             for j in range(len(self.model.W) - 1, -1, -1):
@@ -702,7 +709,12 @@ def main():
                 nc = total // n_classes
                 lat = r.randn(nc, 16).astype(np.float32) + r.randn(1, 16) * 1.5
                 X.append(lat @ W.T + r.randn(nc, DIM) * 0.3)
-                yc = np.zeros((nc, n_classes), dtype=np.float32); yc[:, c] = 1.0
+                # One-hot width is N_P2 for BOTH phases so that phase-1 labels,
+                # phase-2 labels and replay batches share a single label space.
+                # Using `n_classes` here made phase-1 labels 6-wide and phase-2
+                # labels 10-wide, so the replay `np.vstack` raised
+                # "all the input array dimensions ... must match".
+                yc = np.zeros((nc, N_P2), dtype=np.float32); yc[:, c] = 1.0
                 y.append(yc)
             return np.vstack(X).astype(np.float32), np.vstack(y)
 
@@ -710,7 +722,9 @@ def main():
         X_p2, y_p2 = make_phase_data(N_P2, 800, 43)
 
         def run_ewc_exp(use_ewc, use_replay, lam=5000.0):
-            model = MLP([DIM, HID, 64, N_P1], seed=42)  # Phase 1 architecture
+            # Single output layer sized N_P2 for both phases; phase-1 classes
+            # occupy the first N_P1 logits (no head surgery required).
+            model = MLP([DIM, HID, 64, N_P2], seed=42)
             ewc = EWC(model, lam) if use_ewc else None
             results = []; total_steps = 50
             for step in range(1, 26):
@@ -719,18 +733,6 @@ def main():
                 model.train_step(X_p1[idx], y_p1[idx], lr=lr_now)
                 results.append({"step": step, "phase": 1, "acc_old": model.accuracy(X_p1, y_p1), "acc_new": 0.0})
             if ewc: ewc.consolidate(X_p1, y_p1)
-            # Expand model for phase 2 (add new output neurons)
-            old_W, old_b = model.W[-1].copy(), model.b[-1].copy()
-            model.W[-1] = np.zeros((model.W[-1].shape[0], N_P2), dtype=np.float32)
-            model.b[-1] = np.zeros(N_P2, dtype=np.float32)
-            model.W[-1][:, :N_P1] = old_W
-            model.b[-1][:N_P1] = old_b
-            if ewc:
-                old_f, old_s = ewc.fisher[-1].copy(), ewc.star_params[-1].copy()
-                ewc.fisher[-1] = np.zeros(N_P2, dtype=np.float32)
-                ewc.star_params[-1] = np.zeros(N_P2, dtype=np.float32)
-                ewc.fisher[-1][:N_P1] = old_f
-                ewc.star_params[-1][:N_P1] = old_s
             replay_size = int(len(X_p1) * 0.2) if use_replay else 0
             for step in range(26, 51):
                 lr_now = cosine_lr(0.001, step, total_steps, warmup=3)
@@ -794,9 +796,9 @@ def main():
         exp6["No compression"] = {"ratio": 1.0, "accuracy": acc_base}
         print(f"  No compression: acc={acc_base:.4f}")
         for sp in [0.5, 0.7, 0.9, 0.95]:
-            acc = train_compressed(lambda s=sp: topk_sparsify(None, s) if False else topk_sparsify(
-                MLP(ARCH, seed=42).compute_grad(X_comp, y_comp), s), 100)
-            # Fix: actually train with compression
+            # (dead first attempt removed: it called topk_sparsify with a
+            # gradient *list* as the `sparsity` argument and raised
+            # "unsupported operand type(s) for -: 'int' and 'list'")
             def make_topk(s=sp):
                 return lambda g: topk_sparsify(g, s)
             acc = train_compressed(make_topk(), 100)
@@ -823,9 +825,22 @@ def main():
     #  SAVE & PLOT
     # ═══════════════════════════════════════════════════════════
     def ser(rds):
-        if isinstance(rds[0], RoundResult):
-            return [{"round": r.round_num, "loss": r.global_loss, "accuracy": r.global_accuracy} for r in rds]
-        return rds  # detection results are already dicts
+        """Serialise results of any shape used by this script.
+
+        exp1/exp2/exp4 : {method: [RoundResult, ...]}
+        exp3           : {severity: {method: [RoundResult, ...]}}   (nested)
+        exp5           : {label: [dict, ...]}
+        exp6           : {label: {ratio, accuracy}}
+        The previous version only handled the flat list case and indexed
+        `rds[0]` unconditionally, so the nested exp3 dict and the exp6 dict
+        both raised `KeyError: 0`.
+        """
+        if isinstance(rds, list) and rds and isinstance(rds[0], RoundResult):
+            return [{"round": r.round_num, "loss": r.global_loss,
+                     "accuracy": r.global_accuracy} for r in rds]
+        if isinstance(rds, dict):
+            return {k: ser(v) for k, v in rds.items()}
+        return rds
 
     output = {}
     for k, v in all_results.items():

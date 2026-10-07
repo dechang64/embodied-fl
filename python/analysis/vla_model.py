@@ -1,4 +1,3 @@
-from __future__ import annotations
 # ── python/analysis/vla_model.py ──
 """
 VLA (Vision-Language-Action) Federated Model for Embodied Intelligence
@@ -41,12 +40,13 @@ Bridge to Rust:
   → Rust aggregates via TaskAware FedAvg → distributes global model
 """
 
+from __future__ import annotations
 import math
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional
+from typing import Optional
 from dataclasses import dataclass
 
 from .action_tokenizer import ActionTokenizer, TokenizerConfig
@@ -173,9 +173,21 @@ class StateProjector(nn.Module):
 
 
 class CrossAttentionFusion(nn.Module):
-    """Cross-attention fusion of vision, language, and state.
+    """Fuse the vision / language / state tokens into one vector.
 
-    Vision acts as query, language+state as key/value.
+    Implementation note
+    -------------------
+    The original version used the vision token as the *only* query, attended
+    over [language, state], and then let the action head read that single
+    residual-updated token. That leaves the non-vision modalities with about
+    one scalar degree of freedom into the action head and measurably caps
+    accuracy: on the synthetic benchmark a plain ridge readout of the same
+    features reaches ~0.71 while the network plateaued at ~0.39
+    (see experiments/vla_fed/diagnose_vla.py and docs/VLA_REPAIR.md).
+
+    This version runs a standard transformer encoder over *all* modality
+    tokens and mean-pools them, so every modality reaches the action head.
+    The call signature is unchanged.
     """
 
     def __init__(self, d_model: int, n_heads: int, n_layers: int):
@@ -206,22 +218,10 @@ class CrossAttentionFusion(nn.Module):
         Returns:
             (B, d_model) — fused representation
         """
-        # Concatenate lang + state as context
-        context = torch.cat([lang, state], dim=1)  # (B, L+1, d_model)
-
-        # Use vision as query, context as memory
-        x = vision  # (B, 1, d_model)
+        tokens = torch.cat([vision, lang, state], dim=1)   # (B, 2+L, d_model)
         for layer in self.layers:
-            # Self-attention on x, then cross-attention with context
-            x = layer(x)  # Self-attention
-            # Manual cross-attention
-            attn_out = F.scaled_dot_product_attention(
-                x, context, context,
-            )
-            x = x + attn_out
-            x = F.layer_norm(x, x.shape[-1:])
-
-        return x.squeeze(1)  # (B, d_model)
+            tokens = layer(tokens)
+        return tokens.mean(dim=1)                          # (B, d_model)
 
 
 class ActionHead(nn.Module):
@@ -314,8 +314,13 @@ class VLAFLModel(nn.Module):
         )
 
         # Action head (local — stays on each client)
+        # NOTE: the output vocabulary must cover ActionTokenizer token ids,
+        # which are `bin_index + 3` (offset for pad/eos/sos). Passing
+        # `num_action_bins` here would truncate the vocabulary and make
+        # F.cross_entropy raise "target out of bounds" as soon as a binned
+        # action lands in the top three bins.
         self.action_head = ActionHead(
-            cfg.d_model, cfg.action_dim, cfg.num_action_bins
+            cfg.d_model, cfg.action_dim, cfg.num_action_bins + 3
         )
 
         # Action tokenizer (shared config, no learnable params)
@@ -475,6 +480,33 @@ class VLAFLModel(nn.Module):
             if name in shared_names
         }
 
+    def get_full_state_dict(self) -> dict:
+        """Get *all* parameters (backbone + action head) as a state dict.
+
+        Returns:
+            Dict of {name: tensor} covering the whole model.
+        """
+        return {name: p.data.clone() for name, p in self.named_parameters()}
+
+    def load_full_params(self, state_dict: dict):
+        """Load a full state dict produced by get_full_state_dict()."""
+        own_state = self.state_dict()
+        for name, param in state_dict.items():
+            if name in own_state:
+                own_state[name].copy_(param)
+
+    def get_head_state_dict(self) -> dict:
+        """Get the local action-head parameters only."""
+        return {name: p.data.clone() for name, p in self.action_head.named_parameters()}
+
+    def load_head_params(self, state_dict: dict):
+        """Load local action-head parameters."""
+        own_state = self.action_head.state_dict()
+        for name, param in state_dict.items():
+            key = name[len("action_head."):] if name.startswith("action_head.") else name
+            if key in own_state:
+                own_state[key].copy_(param)
+
     def count_parameters(self) -> dict:
         """Count parameters by component."""
         counts = {}
@@ -535,8 +567,10 @@ class VLAFLTrainer:
         action_tokens: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         n_epochs: Optional[int] = None,
+        batch_size: int = 64,
+        shuffle: bool = True,
     ) -> dict:
-        """Run local training epochs.
+        """Run local training epochs with minibatch SGD.
 
         Args:
             vision_features: (N, vision_dim)
@@ -545,30 +579,35 @@ class VLAFLTrainer:
             action_tokens: (N, action_dim)
             attention_mask: (N, L) optional
             n_epochs: Override config.local_epochs
+            batch_size: Minibatch size. The whole split is used every epoch.
+            shuffle: Reshuffle minibatches each epoch.
 
         Returns:
             Dict with loss history and final metrics.
         """
+        N = vision_features.shape[0]
         epochs = n_epochs or self.config.local_epochs
+        bs = min(batch_size, N)
+        steps_per_epoch = max(1, (N + bs - 1) // bs)
         self.model.train()
 
         losses = []
         for epoch in range(epochs):
-            self.optimizer.zero_grad()
+            perm = torch.randperm(N) if shuffle else torch.arange(N)
+            for step in range(steps_per_epoch):
+                idx = perm[step * bs:(step + 1) * bs]
+                self.optimizer.zero_grad(set_to_none=True)
+                logits = self.model(
+                    vision_features[idx], lang_embeddings[idx],
+                    robot_states[idx], None if attention_mask is None else attention_mask[idx],
+                )
+                loss = self.model.compute_loss(logits, action_tokens[idx])
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                losses.append(loss.item())
 
-            logits = self.model(
-                vision_features, lang_embeddings, robot_states, attention_mask
-            )
-            loss = self.model.compute_loss(logits, action_tokens)
-            loss.backward()
-
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-            self.optimizer.step()
-            losses.append(loss.item())
-
-        # Final evaluation
+        # Final evaluation on the data just trained on
         self.model.eval()
         with torch.no_grad():
             logits = self.model(
@@ -579,9 +618,11 @@ class VLAFLTrainer:
 
         return {
             "losses": losses,
-            "final_loss": losses[-1],
+            "final_loss": float(np.mean(losses[-steps_per_epoch:])),
             "accuracy": accuracy,
             "epochs": epochs,
+            "steps": len(losses),
+            "batch_size": bs,
         }
 
     def get_upload_payload(self) -> dict:

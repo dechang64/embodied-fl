@@ -326,7 +326,10 @@ class TestVLAFLModel:
         state = torch.randn(B, 8)
 
         logits = model(vision, lang, state)
-        assert logits.shape == (B, 4, 32)
+        # The head vocabulary is num_action_bins + 3 (pad / eos / sos), matching
+        # ActionTokenizer token ids. It used to be num_action_bins, which made
+        # cross_entropy fail whenever a binned action landed in a top bin.
+        assert logits.shape == (B, 4, 32 + 3)
 
     def test_with_attention_mask(self):
         """Model should handle attention masks."""
@@ -345,7 +348,7 @@ class TestVLAFLModel:
         state = torch.randn(B, 4)
 
         logits = model(vision, lang, state, attention_mask=mask)
-        assert logits.shape == (2, 3, 16)
+        assert logits.shape == (2, 3, 16 + 3)
 
     def test_compute_loss(self):
         """Loss computation should work."""
@@ -360,7 +363,8 @@ class TestVLAFLModel:
         vision = torch.randn(B, 64)
         lang = torch.randn(B, 6, 32)
         state = torch.randn(B, 4)
-        targets = torch.randint(0, 16, (B, 3))
+        # Token ids really emitted by ActionTokenizer live in [0, num_bins+3)
+        targets = torch.randint(0, 16 + 3, (B, 3))
 
         logits = model(vision, lang, state)
         loss = model.compute_loss(logits, targets)
@@ -478,7 +482,7 @@ class TestVLAFLTrainer:
             vision = torch.randn(N, 128)
             lang = torch.randn(N, 8, 64)
             state = torch.randn(N, 8)
-            targets = torch.randint(0, 32, (N, 4))
+            targets = torch.randint(0, 32 + 3, (N, 4))
             trainer.train_local(vision, lang, state, targets)
 
         # FedAvg: sample-weighted average shared params
@@ -496,7 +500,7 @@ class TestVLAFLTrainer:
         lang = torch.randn(5, 8, 64)
         state = torch.randn(5, 8)
         logits = global_model(vision, lang, state)
-        assert logits.shape == (5, 4, 32)
+        assert logits.shape == (5, 4, 32 + 3)
 
 
 if __name__ == "__main__":

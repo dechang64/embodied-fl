@@ -1,4 +1,3 @@
-from __future__ import annotations
 # ── python/analysis/vla_collector.py ──
 """
 VLA Data Collector for Embodied Intelligence
@@ -50,7 +49,9 @@ Bridge to Rust:
   Collected episodes → serialized → gRPC UploadEpisode → Rust stores + indexes
 """
 
+from __future__ import annotations
 import json
+import os
 import time
 import hashlib
 import base64
@@ -264,12 +265,16 @@ class SyntheticCollector(BaseCollector):
         action_dim: int = 8,  # 7 joints + 1 gripper
         image_size: tuple[int, int] = (480, 640),
         seed: int = 42,
+        action_noise: float = 0.02,
     ):
         super().__init__(robot_type)
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.image_size = image_size
         self.seed = seed
+        # Per-step Gaussian perturbation added to the commanded delta.
+        # Controls how noisy (and therefore how hard) the imitation target is.
+        self.action_noise = action_noise
 
     def collect(
         self,
@@ -305,15 +310,6 @@ class SyntheticCollector(BaseCollector):
                 state = (1 - t) * start_state + t * target_state + rng.randn(self.state_dim) * 0.02 * (1 - t)
                 state = state.astype(np.float32)
 
-                # Action: move toward target (state_dim dims) + gripper (1 dim)
-                action_delta = (target_state - state) * 0.3
-                noise = rng.randn(self.action_dim) * 0.01
-                action_vec = np.zeros(self.action_dim, dtype=np.float32)
-                action_vec[:self.state_dim] = action_delta + noise[:self.state_dim]
-                if self.action_dim > self.state_dim:
-                    action_vec[self.state_dim] = noise[self.state_dim]
-                action_vec = np.clip(action_vec, -1.0, 1.0).astype(np.float32)
-
                 gripper = 1.0 if t < 0.4 else (0.0 if t > 0.6 else 1.0 - (t - 0.4) / 0.2)
 
                 obs = Observation(
@@ -322,6 +318,23 @@ class SyntheticCollector(BaseCollector):
                     # No real image in synthetic mode — use placeholder
                     image=None,
                 )
+
+                # Action = a reflexive controller acting on the *observable*
+                # scene (robot state, goal pose, gripper aperture):
+                #   joint dims  : proportional pull toward the episode goal
+                #   gripper dim : proportional pull toward the phase target
+                # The command is therefore a deterministic function of the
+                # scene plus Gaussian noise, so a model that can observe the
+                # scene is in principle able to imitate it. (An earlier version
+                # emitted pure noise on the gripper dim, which caps the
+                # achievable accuracy no matter how good the model is.)
+                gripper_target = 1.0 if t < 0.5 else 0.0
+                action_vec = np.zeros(self.action_dim, dtype=np.float32)
+                action_vec[:self.state_dim] = (target_state - state) * 0.3
+                if self.action_dim > self.state_dim:
+                    action_vec[self.state_dim] = gripper_target - gripper
+                noise = rng.randn(self.action_dim) * self.action_noise
+                action_vec = np.clip(action_vec + noise, -1.0, 1.0).astype(np.float32)
 
                 act = Action(
                     target_joint_pos=action_vec[:self.state_dim].tolist(),
@@ -353,6 +366,10 @@ class SyntheticCollector(BaseCollector):
                     "source": "synthetic",
                     "state_dim": self.state_dim,
                     "action_dim": self.action_dim,
+                    # Episode-level goal. A real VLA agent infers this from the
+                    # scene; here it is recorded so that a *simulated* visual
+                    # encoder can be built from it (see experiments/vla_fed).
+                    "target_state": target_state.tolist(),
                 },
             )
             self.episodes.append(ep)
@@ -771,12 +788,11 @@ def compute_episode_statistics(episodes: list[Episode]) -> dict:
     action_dims = set(ep.action_dim for ep in episodes if ep.action_dim > 0)
     state_dims = set(ep.state_dim for ep in episodes if ep.state_dim > 0)
 
-    n = len(episodes)
     return {
-        "num_episodes": n,
+        "num_episodes": len(episodes),
         "total_steps": total_steps,
-        "avg_steps_per_episode": total_steps / n if n > 0 else 0.0,
-        "success_rate": successes / n if n > 0 else 0.0,
+        "avg_steps_per_episode": total_steps / len(episodes),
+        "success_rate": successes / len(episodes),
         "avg_reward": float(avg_reward),
         "action_dims": list(action_dims),
         "state_dims": list(state_dims),

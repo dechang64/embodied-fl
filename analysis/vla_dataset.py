@@ -48,6 +48,7 @@ class VLASample:
     reward: float = 0.0
     episode_id: str = ""
     step_idx: int = 0
+    goal: Optional[np.ndarray] = None           # (state_dim,) episode goal pose
 
     def __post_init__(self):
         if self.robot_state is None:
@@ -102,6 +103,9 @@ class VLADataset:
             ep_dict = ep.to_dict() if hasattr(ep, "to_dict") else ep
             ep_id = ep_dict.get("episode_id", "unknown")
             steps = ep_dict.get("steps", [])
+            ep_meta = ep_dict.get("metadata", {}) or {}
+            ep_goal = ep_meta.get("target_state")
+            ep_goal = np.array(ep_goal, dtype=np.float32) if ep_goal is not None else None
 
             for step_idx, step in enumerate(steps):
                 obs = step.get("observation", {})
@@ -146,6 +150,7 @@ class VLADataset:
                     reward=float(step.get("reward", 0.0)),
                     episode_id=ep_id,
                     step_idx=step_idx,
+                    goal=ep_goal,
                 )
                 samples.append(sample)
 
