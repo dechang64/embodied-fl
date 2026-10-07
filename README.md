@@ -86,7 +86,11 @@ PYTHONPATH=. python experiments/vla_fed/run_vla_federated.py --mode paper
 # 4. Information-ceiling diagnostic (always run this before trusting #2/#3)
 PYTHONPATH=. python experiments/vla_fed/diagnose_vla.py --mode paper
 
-# 5. Tests
+# 5. Scaling studies — sample count vs goal coverage (~2 h, CPU)
+PYTHONPATH=. python experiments/vla_fed/run_scaling.py --study samples --seeds 0,1,2 --methods local_only,fedavg_full
+PYTHONPATH=. python experiments/vla_fed/run_scaling.py --study goals   --seeds 0,1,2 --methods fedavg_full
+
+# 6. Tests
 PYTHONPATH=. python -m pytest python/tests/ -q
 ```
 
@@ -212,8 +216,36 @@ Two things fall out of this table:
    `fedavg_full` gains +19.1 pt and lands at 93 % of the ridge ceiling.
    Keeping the head local leaves most of the federated benefit on the table.
 
+### What sets the ceiling: goal coverage, not sample count
+
+The binding budget for this task is **which goals you have seen**, not how many
+frames you have. Hold the training set at 19,200 samples (5 clients x 400
+episodes x 12 steps) and change only the number of *distinct* goals in it --
+3 seeds, held-out goals never seen in training (`goal_overlap = 0.000`):
+
+| distinct goals in train | trajectories per goal | test accuracy | trivial floor |
+|---|---|---|---|
+| 20 | 80 | 0.633 +/- 0.022 | 0.292 |
+| 40 | 40 | 0.658 +/- 0.010 | 0.294 |
+| 80 | 20 | 0.736 +/- 0.003 | 0.300 |
+| 160 | 10 | 0.738 +/- 0.002 | 0.291 |
+| 320 | 5 | 0.744 +/- 0.006 | 0.283 |
+
+Spreading the same budget over more goals (20 -> 80) is worth **+10.3 pt**;
+80 -> 320 goals adds **+0.8 pt**. The trivial floor is flat across the sweep
+(0.283-0.300) and so is the action distribution, so this is not a binning
+artefact.
+
+Growing the budget instead -- episodes 50 -> 800, i.e. 2,400 -> 38,400 samples
+-- does help, but saturates: 0.405 / 0.516 / 0.663 / 0.743 / **0.776**, with the
+last doubling buying only +3.3 pt.
+
+Reproduce with `run_scaling.py` (see [docs/VLA_REPAIR.md](docs/VLA_REPAIR.md),
+section 5). Raw output: `results/vla_fed/scaling_goals.json`,
+`results/vla_fed/scaling_samples.json`.
 
 ---
+
 
 ## 🔍 Limitations and open defects
 

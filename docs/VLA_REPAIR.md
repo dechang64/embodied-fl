@@ -9,6 +9,8 @@ Everything below is reproducible:
 cd <repo root>
 PYTHONPATH=. python experiments/vla_fed/diagnose_vla.py --mode paper
 PYTHONPATH=. python experiments/vla_fed/run_vla_federated.py --mode paper
+PYTHONPATH=. python experiments/vla_fed/run_scaling.py --study samples --seeds 0,1,2 --methods local_only,fedavg_full
+PYTHONPATH=. python experiments/vla_fed/run_scaling.py --study goals   --seeds 0,1,2 --methods fedavg_full
 ```
 
 ---
@@ -127,16 +129,81 @@ the data, was the problem.
 
 Two practical lessons came out of this sweep and are encoded in `MODES`:
 
-* **Episode count, not step count, is the binding constraint.** Test accuracy
-  rises monotonically with the number of distinct episode goals: 0.40 / 0.51 /
-  0.58 / 0.68 at 40 / 100 / 200 / 400 episodes. Steps within an episode are
-  highly correlated, so the budget is spent on episodes.
+* **Spend the budget on episodes, not on steps.** Steps within an episode are
+  highly correlated, so episode count buys far more distinct goals per gradient
+  step. This is now measured formally in §5.
 * **32 action bins were too fine** for the available sample size: identical
   settings scored 0.26 test accuracy at 32 bins vs 0.44 at 16 bins.
 
 ---
 
-## 5. Results
+## 5. Learnability is governed by goal coverage, not sample size
+
+The claim behind FedCover-WM — aggregate *coverage statistics* rather than
+parameters or sample counts — needs a controlled measurement: hold the sample
+budget fixed, change only how many distinct goals the training set covers.
+`experiments/vla_fed/run_scaling.py` runs two studies, 3 seeds each, evaluated
+on held-out episodes only.
+
+**Shared setup.** Paper-mode network, 16 quantile action bins,
+`action_noise=0.005`, 12 rounds, 3 local epochs, 5 clients. In **Study B** the
+training set is held at 19,200 samples (5 clients × 400 episodes × 12 steps,
+pooled, 4/5 split) and only the goal-pool size changes. The goal pool is
+injected through `SyntheticCollector.collect(..., goal_pool=...)`, which
+defaults to `None` and leaves the original data path bit-identical.
+
+### Study B — coverage changes, sample size does not
+
+| distinct goals in train | trajectories per goal | test accuracy | trivial floor |
+|---|---|---|---|
+| 20 | 80 | 0.633 ± 0.022 | 0.292 |
+| 40 | 40 | 0.658 ± 0.010 | 0.294 |
+| 80 | 20 | 0.736 ± 0.003 | 0.300 |
+| 160 | 10 | 0.738 ± 0.002 | 0.291 |
+| 320 | 5 | 0.744 ± 0.006 | 0.283 |
+
+At a fixed budget, spreading it over more goals (20 → 80) is worth **+10.3 pt**;
+going from 80 to 320 goals adds only **+0.8 pt**. Repeating each goal 80 times
+is worse than covering four times as many goals with the same samples.
+
+The trivial floor is flat across the sweep (0.283–0.300), and so is the action
+distribution (`mean |a|` 0.066–0.068) — the improvement cannot be attributed to
+binning or a drifting data distribution. Every held-out goal is absent from the
+training set (`goal_overlap = 0.000`): this is pure extrapolation.
+
+Raw output: `results/vla_fed/scaling_goals.json`.
+
+### Study A — sample size changes (goals grow with it)
+
+| episodes / client | train samples | distinct goals | test accuracy | trivial floor |
+|---|---|---|---|---|
+| 50 | 2,400 | 200 | 0.405 ± 0.013 | 0.294 |
+| 100 | 4,800 | 400 | 0.516 ± 0.003 | 0.303 |
+| 200 | 9,600 | 800 | 0.663 ± 0.015 | 0.285 |
+| 400 | 19,200 | 1,600 | 0.743 ± 0.003 | 0.274 |
+| 800 | 38,400 | 3,200 | 0.776 ± 0.002 | 0.277 |
+
+Monotone but saturating: the last doubling buys **+3.3 pt**. In this arm sample
+count and goal count rise together — Study B is what separates them.
+
+Raw output: `results/vla_fed/scaling_samples.json`.
+
+**Cross-check.** Study A's 400-episode arm reproduces the §6 headline table
+per seed (local_only 0.5538 / 0.5512 / 0.5498 and fedavg_full 0.7445 / 0.7388 /
+0.7455, identical to `results_paper.json`), which pins both files to the same
+data path.
+
+> **A defect this study caught.** `run_federated()` used to fall back *silently*
+> to `fedavg_backbone` for any unrecognised method name, so the first Study A run
+> labelled a `fedavg_backbone` column `local_only`. The values matched the
+> paper-mode backbone seeds bit-for-bit, which is how it was spotted. The
+> function now raises on unknown methods, and the column was re-measured; the
+> mis-dispatched values are kept under `_dispatch_artifact` in
+> `scaling_samples.json`.
+
+---
+
+## 6. Results
 
 `run_vla_federated.py --mode paper`, 3 seeds, every method evaluated on
 **held-out episodes only**:
@@ -171,7 +238,7 @@ Interpretation:
 
 ---
 
-## 6. What is deliberately NOT claimed
+## 7. What is deliberately NOT claimed
 
 * These are **synthetic simulation** results. The goal pose is given to the
   simulated encoder directly; no real camera, no real robot, no real

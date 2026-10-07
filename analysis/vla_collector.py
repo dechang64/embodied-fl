@@ -282,6 +282,7 @@ class SyntheticCollector(BaseCollector):
         steps_per_episode: int = 50,
         task_type: str = "grasping",
         instruction: str = "pick up the object",
+        goal_pool: Optional[np.ndarray] = None,
     ) -> list[Episode]:
         """Generate synthetic episodes.
 
@@ -290,19 +291,37 @@ class SyntheticCollector(BaseCollector):
             steps_per_episode: Steps per episode.
             task_type: Task type label.
             instruction: Language instruction for all episodes.
+            goal_pool: Optional (G, state_dim) array of episode goals. When
+                given, episode ``i`` targets ``goal_pool[i % G]`` instead of a
+                freshly drawn goal, which lets a caller hold the *number of
+                distinct goals* G fixed while varying the sample budget — the
+                control needed to tell "more data" apart from "more goals".
+                The marginal goal distribution is unchanged
+                (N(0, 0.3^2)) as long as the pool is drawn the same way as
+                the default. ``None`` reproduces the original behaviour and
+                draws a fresh goal per episode.
 
         Returns:
             List of Episode objects.
         """
         import numpy as np
         rng = np.random.RandomState(self.seed)
+        if goal_pool is not None:
+            goal_pool = np.asarray(goal_pool, dtype=np.float32)
+            if goal_pool.ndim != 2 or goal_pool.shape[1] != self.state_dim:
+                raise ValueError(
+                    f"goal_pool must be (G, {self.state_dim}), got {goal_pool.shape}"
+                )
 
         self.episodes = []
         for ep_idx in range(num_episodes):
             steps = []
             # Simulate a trajectory: start random, converge to target
             start_state = rng.randn(self.state_dim).astype(np.float32) * 0.5
-            target_state = rng.randn(self.state_dim).astype(np.float32) * 0.3
+            if goal_pool is not None:
+                target_state = goal_pool[ep_idx % len(goal_pool)].copy()
+            else:
+                target_state = rng.randn(self.state_dim).astype(np.float32) * 0.3
 
             for step_idx in range(steps_per_episode):
                 t = step_idx / max(steps_per_episode - 1, 1)

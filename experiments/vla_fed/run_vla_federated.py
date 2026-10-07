@@ -43,7 +43,7 @@ import time
 import argparse
 import numpy as np
 from dataclasses import dataclass, asdict, field
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 import torch
 
@@ -87,6 +87,12 @@ class ExperimentConfig:
     binning: str = "quantile"       # "quantile" | "uniform"
     test_episode_stride: int = 5    # every k-th episode -> test split
     seeds: List[int] = field(default_factory=lambda: [0, 1, 2])
+    # Goal-pool control (used by run_scaling.py; None = original behaviour of
+    # drawing a fresh goal per episode). Setting `goal_pool_size = G` makes the
+    # episodes cycle through G distinct goals, which holds the *number of
+    # distinct goals* fixed independently of the sample budget.
+    goal_pool_size: Optional[int] = None
+    goal_pool_seed: int = 12345
 
 
 @dataclass
@@ -295,7 +301,18 @@ def fedavg(updates: List[dict], sizes: List[int]) -> dict:
 def run_federated(cfg: ExperimentConfig, vla_cfg: VLAConfig,
                   train_bundles: List[Dict], test_bundles: List[Dict],
                   method: str, seed: int) -> Dict:
-    """method in {"fedavg_backbone", "fedavg_full"}."""
+    """method in {"fedavg_backbone", "fedavg_full"}.
+
+    Anything else is rejected rather than silently treated as
+    `fedavg_backbone` — an unknown method used to degrade silently, which
+    produced a column that looked plausible and was simply the wrong method.
+    `local_only` has its own entry point (`run_local_only`).
+    """
+    if method not in ("fedavg_backbone", "fedavg_full"):
+        raise ValueError(
+            f"unknown method {method!r}; expected 'fedavg_backbone' or "
+            f"'fedavg_full' (use run_local_only for the no-federation arm)"
+        )
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -381,14 +398,26 @@ def run_local_only(cfg: ExperimentConfig, vla_cfg: VLAConfig,
 # ── Main ──
 
 MODES = {
-    # NOTE ON THE BUDGET. What this task needs is a large number of *distinct
-    # episode goals*: the model has to learn the goal->action relation rather
-    # than memorise the training goals, and the measured test accuracy rises
-    # monotonically with episode count (0.40 / 0.51 / 0.58 / 0.68 at 40 / 100 /
-    # 200 / 400 episodes). Steps *within* an episode are highly correlated, so
-    # we spend the budget on episodes rather than on step count.
+    # NOTE ON THE BUDGET. Two controlled studies back these values
+    # (`run_scaling.py`, 3 seeds each; raw output in
+    # `results/vla_fed/scaling_samples.json` and `scaling_goals.json`):
+    #
+    #   Study A — episodes/client 50/100/200/400/800, steps FIXED at 12.
+    #     Federated test accuracy 0.405 / 0.516 / 0.663 / 0.743 / 0.776.
+    #     Monotone but clearly saturating: the last doubling buys only +3.3 pt.
+    #
+    #   Study B — sample budget HELD at 400x12 = 4800 per client, only the
+    #     number of distinct goals varied (pool 25/50/100/200/400):
+    #     0.633 / 0.658 / 0.736 / 0.738 / 0.744, against a floor that stays
+    #     flat at 0.283-0.300 in every arm. At a fixed sample count, going
+    #     from 20 to 80 distinct training goals is worth +10.3 pt, whereas
+    #     repeating each goal 16 times instead of once is worth nothing.
+    #
+    # Coverage — not sample count — is the binding constraint, which is the
+    # empirical motivation for FedCover-WM. Steps *within* an episode are
+    # highly correlated, so the budget is spent on episodes, not step count.
     # 32 action bins also proved too fine for this sample size (0.26 vs 0.44
-    # test accuracy at 16 bins for otherwise identical settings).
+    # test accuracy at 16 bins, otherwise identical settings).
     "quick": dict(n_clients=3, rounds=8, local_epochs=3, episodes_per_client=120,
                   steps_per_episode=10, d_model=64, action_dim=5, num_action_bins=16,
                   vision_dim=64, lang_dim=64, state_dim=4, seeds=[0, 1]),
