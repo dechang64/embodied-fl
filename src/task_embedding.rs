@@ -1,19 +1,18 @@
-# ── src/task_embedding.rs ──
-"""
-Upgraded Task Embedding with DINOv2 support.
-
-Original: 32-dim hand-crafted one-hot features from task metadata.
-Upgrade: 768-dim DINOv2 self-supervised features from scene images,
-         with fallback to the original 32-dim metadata embedding.
-
-The DINOv2 features capture rich visual semantics of the robot's
-working environment — workspace layout, object types, lighting —
-without requiring any labels.
-"""
-
+//! - src/task_embedding.rs -
+//!
+//! Upgraded Task Embedding with DINOv2 support.
+//!
+//! Original: 32-dim hand-crafted one-hot features from task metadata.
+//! Upgrade: 768-dim DINOv2 self-supervised features from scene images,
+//!          with fallback to the original 32-dim metadata embedding.
+//!
+//! The DINOv2 features capture rich visual semantics of the robot's
+//! working environment — workspace layout, object types, lighting —
+//! without requiring any labels.
+//!
 use anyhow::Result;
 use crate::hnsw_index::HnswIndex;
-use crate::task_registry::{Task, TaskType, Domain};
+use crate::task_registry::{Task, TaskType};
 
 /// Task embedding generator — supports both metadata and vision modes.
 pub struct TaskEmbedding {

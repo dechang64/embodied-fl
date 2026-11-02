@@ -61,6 +61,8 @@ impl TaskType {
             TaskType::Assembly => "assembly",
             TaskType::Inspection => "inspection",
             TaskType::Manipulation => "manipulation",
+            TaskType::DataCollection => "data_collection",
+            TaskType::VLATraining => "vla_training",
             TaskType::Custom(s) => s,
         }
     }
@@ -73,6 +75,8 @@ impl TaskType {
             TaskType::Assembly => [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
             TaskType::Inspection => [0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             TaskType::Manipulation => [0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            TaskType::DataCollection => [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            TaskType::VLATraining => [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
             TaskType::Custom(_) => [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
         }
     }

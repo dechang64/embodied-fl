@@ -1,31 +1,38 @@
 use anyhow::Result;
-use std::path::Path;
+use hnsw::{Hnsw, Searcher, Params};
+use rand_pcg::Pcg64;
+use space::Metric;
 
-/// HNSW 向量索引（基于 hnsw crate）
-///
-/// 用于任务嵌入的快速近似最近邻搜索，
-/// 实现任务感知的联邦聚合加权。
+/// Custom Euclidean distance metric for f32 vectors.
+struct Euclidean;
+
+impl Metric<Vec<f32>> for Euclidean {
+    type Unit = u64;
+    fn distance(&self, a: &Vec<f32>, b: &Vec<f32>) -> u64 {
+        let dist: f32 = a.iter()
+            .zip(b.iter())
+            .map(|(&a, &b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        dist.to_bits() as u64
+    }
+}
+
+/// HNSW vector index for task embedding similarity search.
 pub struct HnswIndex {
-    index: hnsw::Hnsw<f32, space::Euclidean>,
+    index: Hnsw<Euclidean, Vec<f32>, Pcg64, 12, 24>,
     dimension: usize,
-    max_elements: usize,
     ids: Vec<String>,
 }
 
 impl HnswIndex {
-    pub fn new(dimension: usize, max_elements: usize, ef_construction: usize, m: usize) -> Self {
-        let config = hnsw::Config {
-            max_elements,
-            ef_construction,
-            m,
-            ..Default::default()
-        };
-        let index = hnsw::Hnsw::new(config);
+    pub fn new(dimension: usize, _max_elements: usize, ef_construction: usize, _m: usize) -> Self {
+        let params = Params::new().ef_construction(ef_construction);
+        let index = Hnsw::new_params(Euclidean, params);
         Self {
             index,
             dimension,
-            max_elements,
-            ids: Vec::with_capacity(max_elements),
+            ids: Vec::new(),
         }
     }
 
@@ -35,21 +42,29 @@ impl HnswIndex {
 
     pub fn insert(&mut self, id: &str, vector: &[f32]) -> Result<()> {
         assert_eq!(vector.len(), self.dimension, "Vector dimension mismatch");
-        if self.ids.len() >= self.max_elements {
-            anyhow::bail!("HNSW index full: {} / {} elements", self.ids.len(), self.max_elements);
-        }
+        let mut searcher = Searcher::default();
+        self.index.insert(vector.to_vec(), &mut searcher);
         self.ids.push(id.to_string());
-        self.index.insert(vector.to_vec());
         Ok(())
     }
 
     pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Result<Vec<(String, f32)>> {
         assert_eq!(query.len(), self.dimension, "Query dimension mismatch");
-        let neighbors = self.index.search(query, ef_search, k);
-        let results: Vec<(String, f32)> = neighbors
-            .into_iter()
-            .filter_map(|(idx, dist)| {
-                self.ids.get(idx).map(|id| (id.clone(), dist))
+        let mut searcher = Searcher::default();
+        let mut dest: Vec<space::Neighbor<u64>> = (0..k)
+            .map(|_| space::Neighbor {
+                index: 0,
+                distance: 0,
+            })
+            .collect();
+        let found = self.index.nearest(&query.to_vec(), ef_search, &mut searcher, &mut dest);
+        let results: Vec<(String, f32)> = found
+            .iter()
+            .filter_map(|neighbor| {
+                self.ids.get(neighbor.index).map(|id| {
+                    let dist = f32::from_bits(neighbor.distance as u32);
+                    (id.clone(), dist)
+                })
             })
             .collect();
         Ok(results)

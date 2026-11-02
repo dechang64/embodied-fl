@@ -91,7 +91,7 @@ impl AuditChain {
         sql.push_str(" ORDER BY id DESC LIMIT ?2");
 
         let mut stmt = conn.prepare(&sql)?;
-        let entries = if let Some(op) = operation_type {
+        let mut entries = if let Some(op) = operation_type {
             stmt.query_map(rusqlite::params![op, limit], |row| {
                 Ok(AuditEntry {
                     index: row.get(0)?,

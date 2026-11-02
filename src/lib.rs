@@ -9,3 +9,6 @@ pub mod rest_api;
 pub mod web_dashboard;
 pub mod task_embedding;
 pub mod vla_service;
+pub mod fedctx_client;
+pub mod auth;
+pub mod tls;

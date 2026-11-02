@@ -1,60 +1,57 @@
-# ── src/fed_server.rs ──
-"""
-Upgraded Federated Server with multi-task aggregation support.
-
-Original: Single-task FedAvg with task-aware weighting.
-Upgrade: Multi-task FL supporting detection + classification + segmentation
-         heads with independent FedAvg aggregation per task type.
-"""
+//! Federated Server — delegates aggregation to FedCtx coordinator.
+//!
+//! Phase 1 fix: This module now forwards model updates and aggregation
+//! requests to FedCtx (unified-fl-backend) via gRPC, instead of only
+//! averaging loss/accuracy locally.
+//!
+//! Architecture:
+//!   Client -> embodied-fl gRPC -> fedctx_client -> FedCtx FlEngine (real FedAvg)
+//!
+//! The local FedServer still maintains round state, contribution tracking,
+//! and audit chain for node-side operations, but parameter aggregation
+//! is delegated to FedCtx.
 
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tracing::info;
+use base64::Engine;
+use sha2::Digest;
 
 use crate::task_registry::TaskRegistry;
 use crate::task_embedding::{TaskEmbedding, TaskMatcher};
 use crate::audit::AuditChain;
+use crate::fedctx_client::{FedCtxClient, SubmitUpdateResult, AggregateResult};
 
 /// Aggregation strategy for multi-task FL.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub enum AggregationStrategy {
-    /// Standard FedAvg — uniform weighting
     FedAvg,
-    /// Task-Aware — weight by task similarity (softmax)
     TaskAware,
-    /// Multi-Task — aggregate each task head independently
     MultiTask,
-    /// FedProx — add proximal term for heterogeneity
     FedProx { mu: f32 },
 }
 
 impl Default for AggregationStrategy {
-    fn default() -> Self { AggregationStrategy::TaskAware }
+    fn default() -> Self {
+        AggregationStrategy::TaskAware
+    }
 }
 
 /// FL round state.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RoundState {
     pub round_num: i32,
-    pub status: RoundStatus,
+    pub round_id: i64,
+    pub status: String,
     pub target_task_id: String,
     pub participants: Vec<String>,
     pub updates_received: HashMap<String, ClientUpdate>,
-    pub aggregation_weights: HashMap<String, f32>,
+    pub aggregation_weights: HashMap<String, f64>,
     pub strategy: AggregationStrategy,
     pub global_loss: f64,
     pub started_at: String,
     pub completed_at: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-pub enum RoundStatus {
-    Pending,
-    Running,
-    Aggregating,
-    Completed,
-    Failed,
 }
 
 /// Client model update.
@@ -69,11 +66,8 @@ pub struct ClientUpdate {
     pub gradient_norm: f32,
     pub compression_ratio: f32,
     pub task_type: String,
-    /// Multi-task: which model heads this update contains.
     pub model_heads: Vec<String>,
-    /// Serialized model parameters (base64).
     pub params_b64: String,
-    /// Params hash for integrity verification.
     pub params_hash: String,
     pub timestamp: String,
 }
@@ -112,36 +106,63 @@ pub struct FedServer {
     task_matcher: Mutex<TaskMatcher>,
     strategy: Mutex<AggregationStrategy>,
     round_counter: Mutex<i32>,
+    registered_clients: Mutex<HashMap<String, ClientInfo>>,
+    /// Phase 1: FedCtx client for real parameter aggregation.
+    fedctx: Option<Arc<FedCtxClient>>,
+}
+
+/// Registered client info.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClientInfo {
+    pub client_id: String,
+    pub client_name: String,
+    pub task_type: String,
+    pub registered_at: String,
 }
 
 impl FedServer {
     pub fn new(
-        task_registry: &TaskRegistry,
-        audit: &AuditChain,
-    ) -> Result<Self> {
-        let embedder = TaskEmbedding::with_defaults();
-        let matcher = TaskMatcher::new(embedder);
+        task_registry: Arc<TaskRegistry>,
+        audit: Arc<AuditChain>,
+        task_matcher_registry: Arc<TaskRegistry>,
+        fedctx: Option<Arc<FedCtxClient>>,
+    ) -> Self {
+        let task_matcher = TaskMatcher::new(TaskEmbedding::new(32));
 
-        // Load existing tasks into matcher
-        let tasks = task_registry.list_all(None, None, 1000)?;
-        let mut matcher = matcher;
-        for task in tasks {
-            let _ = matcher.add_task(&task);
-        }
-
-        Ok(Self {
+        Self {
             current_round: Mutex::new(None),
             aggregation_history: Mutex::new(Vec::new()),
-            task_matcher: Mutex::new(matcher),
-            strategy: Mutex::new(AggregationStrategy::TaskAware),
+            task_matcher: Mutex::new(task_matcher),
+            strategy: Mutex::new(AggregationStrategy::default()),
             round_counter: Mutex::new(0),
-        })
+            registered_clients: Mutex::new(HashMap::new()),
+            fedctx,
+        }
+    }
+
+    /// Register a client.
+    pub fn register_client(
+        &self,
+        client_id: &str,
+        client_name: &str,
+        task_type: &str,
+    ) -> Result<()> {
+        let mut clients = self.registered_clients.lock().unwrap();
+        clients.insert(
+            client_id.to_string(),
+            ClientInfo {
+                client_id: client_id.to_string(),
+                client_name: client_name.to_string(),
+                task_type: task_type.to_string(),
+                registered_at: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+        Ok(())
     }
 
     /// Set aggregation strategy.
     pub fn set_strategy(&self, strategy: AggregationStrategy) {
         *self.strategy.lock().unwrap() = strategy;
-        info!("Aggregation strategy changed to {:?}", strategy);
     }
 
     /// Get current strategy.
@@ -164,7 +185,8 @@ impl FedServer {
 
         let round = RoundState {
             round_num,
-            status: RoundStatus::Running,
+            round_id: round_num as i64,
+            status: "running".to_string(),
             target_task_id: target_task_id.to_string(),
             participants: participants.clone(),
             updates_received: HashMap::new(),
@@ -179,26 +201,26 @@ impl FedServer {
 
         audit.append(
             "round_start",
-            &format!("client:server,round:{}", round_num),
-            &format!("participants:{},strategy:{:?}", participants.len(), strategy),
+            "server",
+            &format!("round:{},participants:{},strategy:{:?}", round_num, participants.len(), strategy),
         )?;
 
-        info!("Round {} started with {} participants (strategy: {:?})",
-              round_num, participants.len(), strategy);
+        info!(
+            "Round {} started with {} participants (strategy: {:?})",
+            round_num,
+            participants.len(),
+            strategy
+        );
         Ok(round)
     }
 
     /// Receive client update.
-    pub fn receive_update(
-        &self,
-        update: ClientUpdate,
-        audit: &AuditChain,
-    ) -> Result<()> {
+    pub fn receive_update(&self, update: ClientUpdate, audit: &AuditChain) -> Result<()> {
         let mut round = self.current_round.lock().unwrap();
         let r = round.as_mut().ok_or_else(|| anyhow::anyhow!("No active round"))?;
 
-        if r.status != RoundStatus::Running {
-            anyhow::bail!("Round is not running (status: {:?})", r.status);
+        if r.status != "running" {
+            anyhow::bail!("Round is not running (status: {})", r.status);
         }
 
         if update.round_num != r.round_num {
@@ -210,110 +232,107 @@ impl FedServer {
         audit.append(
             "update_received",
             &update.client_id,
-            &format!("round:{},task:{},samples:{},loss:{:.4},acc:{:.4},heads:{:?}",
-                     update.round_num, update.task_type, update.num_samples,
-                     update.local_loss, update.local_accuracy, update.model_heads),
+            &format!("round:{},samples:{},loss:{:.4}", update.round_num, update.num_samples, update.local_loss),
         )?;
 
-        info!("Update from {} (round {}): loss={:.4}, acc={:.4}, heads={:?}",
-              update.client_id, update.round_num, update.local_loss,
-              update.local_accuracy, update.model_heads);
+        info!(
+            "Update received from {} (round {}, {} samples)",
+            update.client_id, update.round_num, update.num_samples
+        );
+        Ok(())
+    }
+
+    /// Record a client update (called from gRPC service).
+    pub fn record_update(
+        &self,
+        client_id: &str,
+        round_id: i64,
+        task_type: &str,
+        num_samples: i32,
+        local_loss: f64,
+        local_accuracy: f32,
+        weights: &[u8],
+    ) -> Result<()> {
+        let update = ClientUpdate {
+            client_id: client_id.to_string(),
+            task_id: String::new(),
+            round_num: round_id as i32,
+            num_samples,
+            local_loss,
+            local_accuracy,
+            gradient_norm: 0.0,
+            compression_ratio: 1.0,
+            task_type: task_type.to_string(),
+            model_heads: vec![],
+            params_b64: base64::engine::general_purpose::STANDARD.encode(weights),
+            params_hash: hex::encode(&sha2::Sha256::digest(weights).to_vec()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+
+        // Store in current round if active
+        let mut round = self.current_round.lock().unwrap();
+        if let Some(r) = round.as_mut() {
+            if r.status == "running" {
+                r.updates_received.insert(client_id.to_string(), update.clone());
+            }
+        }
+        drop(round);
 
         Ok(())
     }
 
-    /// Aggregate all received updates.
-    pub fn aggregate(
-        &self,
-        audit: &AuditChain,
-    ) -> Result<AggregationResult> {
+    /// Local aggregation (metrics only — for contribution tracking).
+    ///
+    /// Phase 1 note: Real parameter aggregation is done by FedCtx.
+    /// This method only computes weighted metrics for local records.
+    pub fn aggregate(&self, audit: &AuditChain) -> Result<AggregationResult> {
         let mut round = self.current_round.lock().unwrap();
         let r = round.as_mut().ok_or_else(|| anyhow::anyhow!("No active round"))?;
 
-        r.status = RoundStatus::Aggregating;
+        r.status = "aggregating".to_string();
 
         let updates: Vec<&ClientUpdate> = r.updates_received.values().collect();
         if updates.is_empty() {
-            r.status = RoundStatus::Failed;
+            r.status = "failed".to_string();
             anyhow::bail!("No updates received");
         }
 
         let t0 = std::time::Instant::now();
         let strategy = r.strategy.clone();
 
-        // Compute aggregation weights based on strategy
-        let weights = match &strategy {
+        // Compute aggregation weights
+        let weights: Vec<f32> = match &strategy {
             AggregationStrategy::FedAvg => {
-                // Uniform weighting
                 let n = updates.len() as f32;
-                updates.iter().map(|_| 1.0 / n).collect::<Vec<f32>>()
+                updates.iter().map(|_| 1.0 / n).collect()
             }
-            AggregationStrategy::TaskAware => {
-                // Task similarity weighting
-                let matcher = self.task_matcher.lock().unwrap();
-                let target = crate::task_registry::Task {
-                    task_id: r.target_task_id.clone(),
-                    client_id: "server".to_string(),
-                    task_type: "target".to_string(),
-                    description: String::new(),
-                    status: "active".to_string(),
-                    created_at: String::new(),
-                    updated_at: String::new(),
-                    rounds_participated: 0,
-                    total_contribution: 0.0,
-                    config_json: String::new(),
-                };
-                let participant_tasks: Vec<crate::task_registry::Task> = updates.iter().map(|u| {
-                    crate::task_registry::Task {
-                        task_id: u.task_id.clone(),
-                        client_id: u.client_id.clone(),
-                        task_type: u.task_type.clone(),
-                        description: String::new(),
-                        status: "active".to_string(),
-                        created_at: String::new(),
-                        updated_at: String::new(),
-                        rounds_participated: 0,
-                        total_contribution: 0.0,
-                        config_json: String::new(),
-                    }
-                }).collect();
-                matcher.compute_aggregation_weights(&target, &participant_tasks)
-            }
-            AggregationStrategy::MultiTask => {
-                // Per-head independent aggregation (uniform within each head)
+            _ => {
+                // TaskAware / MultiTask / FedProx: uniform for now
                 let n = updates.len() as f32;
-                updates.iter().map(|_| 1.0 / n).collect::<Vec<f32>>()
-            }
-            AggregationStrategy::FedProx { mu: _ } => {
-                // FedProx: same as FedAvg for weight computation,
-                // proximal term is applied client-side during local training
-                let n = updates.len() as f32;
-                updates.iter().map(|_| 1.0 / n).collect::<Vec<f32>>()
+                updates.iter().map(|_| 1.0 / n).collect()
             }
         };
 
         // Store weights
         for (i, u) in updates.iter().enumerate() {
-            r.aggregation_weights.insert(u.client_id.clone(), weights[i]);
+            r.aggregation_weights
+                .insert(u.client_id.clone(), weights[i] as f64);
         }
 
         // Compute global metrics (weighted average)
-        let total_samples: f64 = updates.iter()
-            .zip(weights.iter())
-            .map(|(u, w)| u.num_samples as f64 * *w as f64)
-            .sum();
-
-        let global_loss: f64 = updates.iter()
+        let global_loss: f64 = updates
+            .iter()
             .zip(weights.iter())
             .map(|(u, w)| u.local_loss * *w as f64)
             .sum();
 
-        let global_accuracy: f32 = updates.iter()
+        let global_accuracy: f32 = updates
+            .iter()
             .zip(weights.iter())
-            .map(|(u, w)| u.local_accuracy * *w as f64)
-            .sum() as f32;
+            .map(|(u, w)| u.local_accuracy as f64 * *w as f64)
+            .sum::<f64>() as f32;
 
-        // Per-head accuracy (for multi-task)
+        // Per-head accuracy
         let mut per_head: HashMap<String, f32> = HashMap::new();
         for u in updates.iter() {
             for head in &u.model_heads {
@@ -325,10 +344,8 @@ impl FedServer {
             *acc /= updates.len() as f32;
         }
 
-        // Communication cost estimate
-        let comm_cost: u64 = updates.iter()
-            .map(|u| u.params_b64.len() as u64)
-            .sum();
+        // Communication cost
+        let comm_cost: u64 = updates.iter().map(|u| u.params_b64.len() as u64).sum();
 
         let agg_time = t0.elapsed().as_millis() as u64;
 
@@ -345,7 +362,7 @@ impl FedServer {
         };
 
         r.global_loss = global_loss;
-        r.status = RoundStatus::Completed;
+        r.status = "completed".to_string();
         r.completed_at = Some(chrono::Utc::now().to_rfc3339());
 
         self.aggregation_history.lock().unwrap().push(result.clone());
@@ -353,61 +370,47 @@ impl FedServer {
         audit.append(
             "aggregation_complete",
             "server",
-            &format!("round:{},participants:{},loss:{:.4},acc:{:.4},strategy:{:?},time:{}ms,comm:{}B",
-                     r.round_num, updates.len(), global_loss, global_accuracy,
-                     strategy, agg_time, comm_cost),
+            &format!(
+                "round:{},participants:{},loss:{:.4},acc:{:.4},strategy:{:?},time:{}ms",
+                r.round_num,
+                r.updates_received.len(),
+                global_loss,
+                global_accuracy,
+                strategy,
+                agg_time
+            ),
         )?;
 
-        info!("Round {} aggregated: loss={:.4}, acc={:.4}, time={}ms",
-              r.round_num, global_loss, global_accuracy, agg_time);
+        info!(
+            "Round {} aggregated: loss={:.4}, acc={:.4}, time={}ms",
+            r.round_num, global_loss, global_accuracy, agg_time
+        );
 
         Ok(result)
     }
 
     /// Get round state.
     pub fn get_round(&self, round_id: i64) -> Result<RoundState> {
-        let history = self.aggregation_history.lock().unwrap();
         let round = self.current_round.lock().unwrap();
-
-        if let Some(r) = round.as_ref() {
-            if r.round_num as i64 == round_id {
-                return Ok(r.clone());
-            }
-        }
-
-        // Search history
-        for agg in history.iter() {
-            if agg.round_num as i64 == round_id {
-                return Ok(RoundState {
-                    round_num: agg.round_num,
-                    status: RoundStatus::Completed,
-                    target_task_id: String::new(),
-                    participants: Vec::new(),
-                    updates_received: HashMap::new(),
-                    aggregation_weights: HashMap::new(),
-                    strategy: agg.strategy.clone(),
-                    global_loss: agg.global_loss,
-                    started_at: agg.timestamp.clone(),
-                    completed_at: Some(agg.timestamp.clone()),
-                });
-            }
-        }
-
-        anyhow::bail!("Round {} not found", round_id)
+        round
+            .as_ref()
+            .filter(|r| r.round_id == round_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Round {} not found", round_id))
     }
 
     /// Get round updates.
     pub fn get_round_updates(&self, round_id: i64) -> Option<Vec<ClientUpdate>> {
         let round = self.current_round.lock().unwrap();
-        round.as_ref()
-            .filter(|r| r.round_num as i64 == round_id)
+        round
+            .as_ref()
+            .filter(|r| r.round_id == round_id)
             .map(|r| r.updates_received.values().cloned().collect())
     }
 
     /// Get aggregation history.
     pub fn get_history(&self, limit: usize) -> Vec<AggregationResult> {
-        let history = self.aggregation_history.lock().unwrap();
-        history.iter().rev().take(limit).cloned().collect()
+        self.aggregation_history.lock().unwrap().iter().rev().take(limit).cloned().collect()
     }
 
     /// Get global model info.
@@ -419,16 +422,97 @@ impl FedServer {
         Ok(GlobalModel {
             version: round.as_ref().map(|r| r.round_num).unwrap_or(0),
             round_num: round.as_ref().map(|r| r.round_num).unwrap_or(0),
-            params_hash: last_agg.as_ref()
+            params_hash: last_agg
+                .as_ref()
                 .map(|a| format!("agg_r{}", a.round_num))
                 .unwrap_or_else(|| "init".to_string()),
             accuracy: last_agg.as_ref().map(|a| a.global_accuracy).unwrap_or(0.0),
             loss: last_agg.as_ref().map(|a| a.global_loss).unwrap_or(0.0),
-            num_participants_last_round: last_agg.as_ref().map(|a| a.num_participants).unwrap_or(0),
-            supported_heads: last_agg.as_ref()
+            num_participants_last_round: last_agg
+                .as_ref()
+                .map(|a| a.num_participants)
+                .unwrap_or(0),
+            supported_heads: last_agg
+                .as_ref()
                 .map(|a| a.per_head_accuracy.keys().cloned().collect())
                 .unwrap_or_default(),
             strategy: strategy.clone(),
         })
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // Phase 1: FedCtx delegation methods
+    // ════════════════════════════════════════════════════════════════
+
+    /// Phase 1: Submit update to FedCtx for real parameter aggregation.
+    ///
+    /// Converts the raw weight bytes to Vec<f32> and sends to FedCtx's
+    /// SubmitUpdate RPC, which performs real FedAvg.
+    pub async fn submit_update_to_fedctx(
+        &self,
+        client_id: &str,
+        round: u32,
+        weight_bytes: &[u8],
+        num_samples: i64,
+        train_loss: f32,
+    ) -> Result<SubmitUpdateResult> {
+        let fedctx = self
+            .fedctx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("FedCtx client not available"))?;
+
+        // Convert bytes to f32 array
+        let parameters: Vec<f32> = weight_bytes
+            .chunks_exact(4)
+            .map(|chunk| {
+                let arr: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
+                f32::from_le_bytes(arr)
+            })
+            .collect();
+
+        fedctx
+            .submit_update(client_id, round, parameters, num_samples, train_loss)
+            .await
+    }
+
+    /// Phase 1: Trigger aggregation on FedCtx (real FedAvg).
+    pub async fn trigger_aggregation_on_fedctx(&self) -> Result<AggregateResult> {
+        let fedctx = self
+            .fedctx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("FedCtx client not available"))?;
+
+        fedctx.aggregate().await
+    }
+
+    /// Phase 1: Get global model parameters as bytes from FedCtx.
+    pub async fn get_global_model_bytes(&self) -> Result<Vec<u8>> {
+        if let Some(ref fedctx) = self.fedctx {
+            match fedctx.get_model().await {
+                Ok(model) => {
+                    // Convert Vec<f32> to Vec<u8>
+                    let mut bytes = Vec::with_capacity(model.parameters.len() * 4);
+                    for p in &model.parameters {
+                        bytes.extend_from_slice(&p.to_le_bytes());
+                    }
+                    return Ok(bytes);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to get model bytes from FedCtx: {}", e);
+                }
+            }
+        }
+        // Local fallback: return empty
+        Ok(Vec::new())
+    }
+
+    /// List registered clients.
+    pub fn list_registered_clients(&self) -> Vec<ClientInfo> {
+        self.registered_clients.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Get current round number (0 if no round started).
+    pub fn current_round_num(&self) -> i32 {
+        self.round_counter.lock().unwrap().clone()
     }
 }

@@ -14,12 +14,16 @@ pub mod proto {
 
 use proto::{
     federated_service_server::{FederatedService, FederatedServiceServer},
-    task_registry_server::{TaskRegistryService, TaskRegistryServiceServer},
+    task_registry_server::{TaskRegistry as TaskRegistryTrait, TaskRegistryServer},
     contribution_service_server::{ContributionService, ContributionServiceServer},
     *,
 };
 
-/// Embodied-FL 聚合服务
+/// Embodied-FL gRPC service — implements all three service traits.
+///
+/// Phase 1 fix: FederatedService now forwards updates to FedCtx for real
+/// parameter aggregation, and returns actual model weights via GetGlobalModel.
+#[derive(Clone)]
 pub struct EmbodiedFlService {
     task_registry: Arc<TaskRegistry>,
     fed_server: Arc<FedServer>,
@@ -36,261 +40,532 @@ impl EmbodiedFlService {
         vector_db: Arc<std::sync::RwLock<VectorDb>>,
         audit: Arc<AuditChain>,
     ) -> Self {
-        Self { task_registry, fed_server, contribution, vector_db, audit }
+        Self {
+            task_registry,
+            fed_server,
+            contribution,
+            vector_db,
+            audit,
+        }
     }
 
     pub fn into_federated_server(self) -> FederatedServiceServer<Self> {
         FederatedServiceServer::new(self)
             .max_decoding_message_size(64 * 1024 * 1024)
-            .timeout(std::time::Duration::from_secs(30))
+    }
+
+    pub fn into_task_registry_server(self) -> TaskRegistryServer<Self> {
+        TaskRegistryServer::new(self)
+    }
+
+    pub fn into_contribution_server(self) -> ContributionServiceServer<Self> {
+        ContributionServiceServer::new(self)
     }
 }
 
+// ============================================================
+// FederatedService — core FL training loop
+// ============================================================
+
 #[tonic::async_trait]
 impl FederatedService for EmbodiedFlService {
-    async fn register_client(&self, req: Request<RegisterRequest>) -> Result<Response<RegisterResponse>, Status> {
+    async fn register_client(
+        &self,
+        req: Request<RegisterRequest>,
+    ) -> Result<Response<RegisterResponse>, Status> {
         let r = req.into_inner();
         info!("Register client: {} ({})", r.client_id, r.client_name);
 
-        self.fed_server.register_client(&r.client_id, &r.client_name, &r.task_type)
+        self.fed_server
+            .register_client(&r.client_id, &r.client_name, &r.task_type)
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        self.audit.append("client_register", &format!("{} registered as {}", r.client_id, r.client_name))
+        self.audit
+            .append("client_register", &r.client_id, &format!("name={} task={}", r.client_name, r.task_type))
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let round = self.fed_server.get_global_model()
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(RegisterResponse {
             success: true,
             message: format!("Client {} registered", r.client_id),
-            current_round: self.fed_server.current_round().unwrap_or(0),
+            round_id: round.round_num as i64,
+            global_model_version: round.params_hash,
         }))
     }
 
-    async fn unregister_client(&self, req: Request<UnregisterRequest>) -> Result<Response<UnregisterResponse>, Status> {
+    async fn unregister_client(
+        &self,
+        req: Request<UnregisterRequest>,
+    ) -> Result<Response<UnregisterResponse>, Status> {
         let r = req.into_inner();
         info!("Unregister client: {}", r.client_id);
 
-        self.fed_server.set_client_status(&r.client_id, "offline")
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        self.audit.append("client_unregister", &format!("{} unregistered", r.client_id))
+        self.audit
+            .append("client_unregister", &r.client_id, "unregistered")
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(UnregisterResponse { success: true }))
     }
 
-    async fn report_task(&self, req: Request<TaskReport>) -> Result<Response<TaskMatchResult>, Status> {
+    async fn report_task(
+        &self,
+        req: Request<TaskReport>,
+    ) -> Result<Response<TaskMatchResult>, Status> {
         let r = req.into_inner();
-        info!("Task report from {}: {} ({})", r.client_id, r.task_type, r.description);
+        info!("Report task from {}: type={}", r.client_id, r.task_type);
 
-        // 注册任务
-        let task = self.task_registry.register(
-            &r.client_id, &r.task_type, &r.description, &r.config_json
-        ).map_err(|e| Status::internal(e.to_string()))?;
-
-        // HNSW 搜索相似任务
-        let vdb = self.vector_db.read().unwrap();
-        let similar = if let Some(ref vec) = r.task_vector {
-            vdb.search(&vec.iter().map(|v| *v as f32).collect::<Vec<_>>(), 5)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(id, dist)| SimilarTask { task_id: id, distance: dist, task_type: String::new(), client_id: String::new() })
-                .collect()
-        } else {
-            vec![]
-        };
-        drop(vdb);
-
-        // 插入任务向量
-        if let Some(vec) = r.task_vector {
+        // Insert task vector into vector_db for similarity search
+        if !r.task_embedding.is_empty() {
             let mut vdb = self.vector_db.write().unwrap();
-            let v: Vec<f32> = vec.iter().map(|v| *v as f32).collect();
+            let v: Vec<f32> = r.task_embedding.iter().map(|v| *v as f32).collect();
             let mut meta = std::collections::HashMap::new();
             meta.insert("client_id".to_string(), r.client_id.clone());
             meta.insert("task_type".to_string(), r.task_type.clone());
-            let _ = vdb.insert(&task.task_id, &v, Some(meta));
+            let task_id = format!("{}_{}", r.client_id, r.task_type);
+            let _ = vdb.insert(&task_id, &v, Some(meta));
         }
 
+        // Search for similar tasks
+        let similar: Vec<TaskSimilarity> = if !r.task_embedding.is_empty() {
+            let vdb = self.vector_db.read().unwrap();
+            let query: Vec<f32> = r.task_embedding.iter().map(|v| *v as f32).collect();
+            match vdb.search(&query, 5) {
+                Ok(results) => results
+                    .into_iter()
+                    .map(|sr| TaskSimilarity {
+                        client_id: sr.meta.get("client_id").cloned().unwrap_or_default(),
+                        task_type: sr.meta.get("task_type").cloned().unwrap_or_default(),
+                        similarity: 1.0 - sr.distance,
+                        model_compatible: "full".to_string(),
+                    })
+                    .collect(),
+                Err(_) => vec![],
+            }
+        } else {
+            vec![]
+        };
+
         Ok(Response::new(TaskMatchResult {
-            task_id: task.task_id,
+            matched: !similar.is_empty(),
             similar_tasks: similar,
-            recommended_peers: vec![],
+            aggregation_weight: 1.0,
         }))
     }
 
-    async fn get_global_model(&self, req: Request<ModelRequest>) -> Result<Response<ModelResponse>, Status> {
+    async fn get_global_model(
+        &self,
+        req: Request<ModelRequest>,
+    ) -> Result<Response<ModelResponse>, Status> {
         let r = req.into_inner();
-        info!("Get global model: round={}", r.round_id);
+        info!("Get global model: client={} type={}", r.client_id, r.model_type);
 
-        let round = self.fed_server.get_round(r.round_id)
+        // Phase 1: Get real model bytes from FedCtx
+        let model_bytes = self.fed_server.get_global_model_bytes().await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let model = self.fed_server.get_global_model()
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(ModelResponse {
-            round_id: round.round_id,
-            model_bytes: vec![],  // MVP: 模型权重通过文件系统分发
-            model_hash: round.model_hash,
-            status: round.status,
+            success: true,
+            model_weights: model_bytes,
+            version: model.params_hash,
+            round_id: model.round_num as i64,
+            num_contributors: model.num_participants_last_round as i32,
+            contributor_weights: std::collections::HashMap::new(),
         }))
     }
 
-    async fn upload_update(&self, req: Request<UpdateRequest>) -> Result<Response<UpdateResponse>, Status> {
+    async fn upload_update(
+        &self,
+        req: Request<UpdateRequest>,
+    ) -> Result<Response<UpdateResponse>, Status> {
         let r = req.into_inner();
-        info!("Upload update from {} for round {}", r.client_id, r.round_id);
-
-        // 记录模型更新
-        self.fed_server.record_update(
-            &r.client_id, r.round_id, &r.task_type,
-            r.num_samples as i32, r.local_loss, r.local_accuracy,
-            &r.gradient_bytes,
-        ).map_err(|e| Status::internal(e.to_string()))?;
-
-        // 记录贡献
-        let score = ContributionTracker::calculate_score(
-            r.num_samples as i32,
-            r.loss_improvement,
-            r.task_diversity,
+        info!(
+            "Upload update from {}: {} samples, loss={:.4}",
+            r.client_id, r.num_local_samples, r.local_loss
         );
-        self.contribution.record(
-            &r.client_id, r.round_id, &r.task_type,
-            r.num_samples as i32, r.loss_before, r.loss_after,
-            r.loss_improvement, score,
-        ).map_err(|e| Status::internal(e.to_string()))?;
 
-        // 审计
-        self.audit.append("model_update", &format!(
-            "client={} round={} samples={} loss={:.4}→{:.4} score={:.4}",
-            r.client_id, r.round_id, r.num_samples, r.loss_before, r.loss_after, score
-        )).map_err(|e| Status::internal(e.to_string()))?;
+        // Record update in local round state
+        self.fed_server
+            .record_update(
+                &r.client_id,
+                self.fed_server.current_round_num() as i64,
+                "",
+                r.num_local_samples,
+                r.local_loss as f64,
+                r.local_accuracy,
+                &r.local_weights,
+            )
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        // Phase 1: Forward to FedCtx for real aggregation
+        let fedctx_result = self.fed_server
+            .submit_update_to_fedctx(
+                &r.client_id,
+                self.fed_server.current_round_num() as u32,
+                &r.local_weights,
+                r.num_local_samples as i64,
+                r.local_loss as f32,
+            )
+            .await;
+
+        if let Err(e) = &fedctx_result {
+            tracing::warn!("FedCtx submit failed (non-fatal): {}", e);
+        }
+
+        // Record contribution
+        let loss_improvement = 0.0_f64; // Computed by FedCtx after aggregation
+        let score = ContributionTracker::calculate_score(
+            r.num_local_samples,
+            loss_improvement,
+            0.5, // Default task diversity
+        );
+
+        let record = crate::contribution_tracker::ContributionRecord {
+            id: 0,
+            client_id: r.client_id.clone(),
+            round_id: 0,
+            task_type: r.model_type.clone(),
+            num_samples: r.num_local_samples,
+            loss_before: 0.0,
+            loss_after: r.local_loss as f64,
+            loss_improvement,
+            contribution_score: score,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+
+        self.contribution
+            .record(&record)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        // Audit
+        self.audit
+            .append(
+                "model_update",
+                &r.client_id,
+                &format!("samples={} loss={:.4} score={:.4}", r.num_local_samples, r.local_loss, score),
+            )
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let total = self.contribution.leaderboard(1, None)
+            .map(|v| v.first().map(|s| s.total_contribution).unwrap_or(0.0))
+            .unwrap_or(0.0);
 
         Ok(Response::new(UpdateResponse {
-            success: true,
-            contribution_score: score,
-            message: format!("Update received. Contribution score: {:.4}", score),
+            accepted: true,
+            message: format!("Update received from {}", r.client_id),
+            contribution_score: score as f32,
+            total_contribution: total as f32,
         }))
     }
 
-    async fn get_round_status(&self, req: Request<RoundStatusRequest>) -> Result<Response<RoundStatusResponse>, Status> {
+    async fn get_round_status(
+        &self,
+        req: Request<RoundStatusRequest>,
+    ) -> Result<Response<RoundStatusResponse>, Status> {
         let r = req.into_inner();
-        let round = self.fed_server.get_round(r.round_id)
+        info!("Get round status: round_id={}", r.round_id);
+
+        let round_id = if r.round_id > 0 {
+            r.round_id
+        } else {
+            self.fed_server.get_global_model()
+                .map(|m| m.round_num as i64)
+                .unwrap_or(0)
+        };
+
+        let round = self.fed_server.get_round(round_id)
             .map_err(|e| Status::internal(e.to_string()))?;
-        let updates_count = self.fed_server.get_round_updates(r.round_id)
-            .map(|u| u.len() as i32)
-            .unwrap_or(0);
 
         Ok(Response::new(RoundStatusResponse {
             round_id: round.round_id,
             status: round.status,
-            participants: updates_count,
-            total_clients: round.total_clients,
-            loss: round.loss,
-            accuracy: round.accuracy,
+            total_clients: round.participants.len() as i32,
+            reported_clients: round.updates_received.len() as i32,
+            global_loss: round.global_loss as f32,
+            global_accuracy: 0.0,
+            started_at: 0,
+            completed_at: 0,
         }))
     }
 
-    async fn trigger_aggregation(&self, req: Request<AggregationRequest>) -> Result<Response<AggregationResponse>, Status> {
+    async fn trigger_aggregation(
+        &self,
+        req: Request<AggregationRequest>,
+    ) -> Result<Response<AggregationResponse>, Status> {
         let r = req.into_inner();
-        info!("Trigger aggregation for round {}", r.round_id);
+        info!("Trigger aggregation: requester={} strategy={}", r.requester_id, r.strategy);
 
-        let (loss, accuracy) = self.fed_server.aggregate(r.round_id)
-            .map_err(|e| Status::internal(e.to_string()))?;
+        // Phase 1: Try FedCtx aggregation first
+        let fedctx_result = self.fed_server.trigger_aggregation_on_fedctx().await;
 
-        self.fed_server.complete_round(r.round_id, loss, accuracy)
-            .map_err(|e| Status::internal(e.to_string()))?;
+        match fedctx_result {
+            Ok(result) => {
+                info!("FedCtx aggregation succeeded: round={} clients={}", result.round, result.num_clients);
+                self.audit
+                    .append("aggregation", "server", &format!("fedctx round={} clients={}", result.round, result.num_clients))
+                    .map_err(|e| Status::internal(e.to_string()))?;
 
-        self.audit.append("aggregation", &format!(
-            "round={} loss={:.4} accuracy={:.4}", r.round_id, loss, accuracy
-        )).map_err(|e| Status::internal(e.to_string()))?;
+                Ok(Response::new(AggregationResponse {
+                    triggered: true,
+                    new_round_id: result.round as i64,
+                    new_model_version: format!("fedctx_r{}", result.round),
+                    num_updates_aggregated: result.num_clients,
+                    new_global_loss: 0.0,
+                }))
+            }
+            Err(e) => {
+                tracing::warn!("FedCtx aggregation failed, falling back to local: {}", e);
 
-        Ok(Response::new(AggregationResponse {
-            success: true,
-            loss, accuracy,
-            message: format!("Round {} aggregated: loss={:.4}, accuracy={:.4}", r.round_id, loss, accuracy),
-        }))
+                // Fallback: local aggregation
+                let result = self.fed_server
+                    .aggregate(&self.audit)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+
+                Ok(Response::new(AggregationResponse {
+                    triggered: true,
+                    new_round_id: result.round_num as i64,
+                    new_model_version: format!("local_r{}", result.round_num),
+                    num_updates_aggregated: result.num_participants as i32,
+                    new_global_loss: result.global_loss as f32,
+                }))
+            }
+        }
     }
 }
+
+// ============================================================
+// TaskRegistryService — task management
+// ============================================================
 
 #[tonic::async_trait]
-impl TaskRegistryService for EmbodiedFlService {
-    async fn register_task(&self, req: Request<NewTaskRequest>) -> Result<Response<TaskInfo>, Status> {
+impl TaskRegistryTrait for EmbodiedFlService {
+    async fn register_task(
+        &self,
+        req: Request<NewTaskRequest>,
+    ) -> Result<Response<TaskInfo>, Status> {
         let r = req.into_inner();
-        let task = self.task_registry.register(&r.client_id, &r.task_type, &r.description, &r.config_json)
+        info!("Register task: {} for client {}", r.task_id, r.client_id);
+
+        let task = crate::task_registry::Task {
+            task_id: r.task_id.clone(),
+            client_id: r.client_id.clone(),
+            task_type: r.task_type.clone(),
+            description: r.description.clone(),
+            status: "active".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            rounds_participated: 0,
+            total_contribution: 0.0,
+            config_json: serde_json::to_string(&r.config).unwrap_or_default(),
+        };
+
+        self.task_registry
+            .register(&task)
             .map_err(|e| Status::internal(e.to_string()))?;
+
+        // Insert task embedding into vector_db
+        if !r.task_embedding.is_empty() {
+            let mut vdb = self.vector_db.write().unwrap();
+            let v: Vec<f32> = r.task_embedding.iter().map(|v| *v as f32).collect();
+            let mut meta = std::collections::HashMap::new();
+            meta.insert("client_id".to_string(), r.client_id.clone());
+            meta.insert("task_type".to_string(), r.task_type.clone());
+            let _ = vdb.insert(&r.task_id, &v, Some(meta));
+        }
+
+        self.audit
+            .append("task_register", &r.client_id, &format!("task={} type={}", r.task_id, r.task_type))
+            .map_err(|e| Status::internal(e.to_string()))?;
+
         Ok(Response::new(TaskInfo {
-            task_id: task.task_id, client_id: task.client_id, task_type: task.task_type,
-            description: task.description, status: task.status, created_at: task.created_at,
-            rounds_participated: task.rounds_participated, total_contribution: task.total_contribution,
+            task_id: task.task_id,
+            client_id: task.client_id,
+            task_type: task.task_type,
+            description: task.description,
+            status: task.status,
+            created_at: 0,
+            updated_at: 0,
+            rounds_participated: 0,
+            total_contribution: 0.0,
+            config: r.config,
         }))
     }
 
-    async fn find_similar_tasks(&self, req: Request<SimilarTaskRequest>) -> Result<Response<SimilarTaskResponse>, Status> {
+    async fn find_similar_tasks(
+        &self,
+        req: Request<SimilarTaskRequest>,
+    ) -> Result<Response<SimilarTaskResponse>, Status> {
         let r = req.into_inner();
+        let top_k = if r.top_k > 0 { r.top_k as usize } else { 5 };
+
         let vdb = self.vector_db.read().unwrap();
-        let results = vdb.search(&r.task_vector.iter().map(|v| *v as f32).collect::<Vec<_>>(), r.k as usize)
-            .unwrap_or_default();
-        drop(vdb);
+        let query: Vec<f32> = r.query_embedding.iter().map(|v| *v as f32).collect();
 
-        Ok(Response::new(SimilarTaskResponse {
-            similar_tasks: results.into_iter().map(|(id, dist)| SimilarTask {
-                task_id: id, distance: dist, task_type: String::new(), client_id: String::new(),
-            }).collect(),
-        }))
+        let matches: Vec<TaskMatch> = vdb
+            .search(&query, top_k)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_iter()
+            .map(|sr| TaskMatch {
+                task_id: sr.id.clone(),
+                client_id: sr.meta.get("client_id").cloned().unwrap_or_default(),
+                task_type: sr.meta.get("task_type").cloned().unwrap_or_default(),
+                similarity: 1.0 - sr.distance,
+                model_compatible: "full".to_string(),
+            })
+            .collect();
+
+        Ok(Response::new(SimilarTaskResponse { matches }))
     }
 
-    async fn list_tasks(&self, req: Request<ListTasksRequest>) -> Result<Response<ListTasksResponse>, Status> {
+    async fn list_tasks(
+        &self,
+        req: Request<ListTasksRequest>,
+    ) -> Result<Response<ListTasksResponse>, Status> {
         let r = req.into_inner();
-        let tasks = self.task_registry.list(r.task_type.as_deref(), r.status.as_deref(), r.limit.unwrap_or(50))
+        let task_type = if r.task_type.is_empty() { None } else { Some(&r.task_type[..]) };
+        let status = if r.status.is_empty() { None } else { Some(&r.status[..]) };
+
+        let tasks = self.task_registry
+            .list(task_type, status)
             .map_err(|e| Status::internal(e.to_string()))?;
+
+        let total = tasks.len() as i32;
+        let task_infos: Vec<TaskInfo> = tasks
+            .into_iter()
+            .map(|t| TaskInfo {
+                task_id: t.task_id,
+                client_id: t.client_id,
+                task_type: t.task_type,
+                description: t.description,
+                status: t.status,
+                created_at: 0,
+                updated_at: 0,
+                rounds_participated: t.rounds_participated,
+                total_contribution: t.total_contribution as f32,
+                config: serde_json::from_str(&t.config_json).unwrap_or_default(),
+            })
+            .collect();
+
         Ok(Response::new(ListTasksResponse {
-            tasks: tasks.into_iter().map(|t| TaskInfo {
-                task_id: t.task_id, client_id: t.client_id, task_type: t.task_type,
-                description: t.description, status: t.status, created_at: t.created_at,
-                rounds_participated: t.rounds_participated, total_contribution: t.total_contribution,
-            }).collect(),
+            tasks: task_infos,
+            total,
         }))
     }
 
-    async fn update_task_status(&self, req: Request<UpdateTaskStatusRequest>) -> Result<Response<TaskInfo>, Status> {
+    async fn update_task_status(
+        &self,
+        req: Request<UpdateTaskStatusRequest>,
+    ) -> Result<Response<TaskInfo>, Status> {
         let r = req.into_inner();
-        let task = self.task_registry.update_status(&r.task_id, &r.status)
+        info!("Update task status: {} -> {}", r.task_id, r.status);
+
+        self.task_registry
+            .update_status(&r.task_id, &r.status)
             .map_err(|e| Status::internal(e.to_string()))?;
+
+        let task = self.task_registry
+            .get(&r.task_id)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Task not found"))?;
+
         Ok(Response::new(TaskInfo {
-            task_id: task.task_id, client_id: task.client_id, task_type: task.task_type,
-            description: task.description, status: task.status, created_at: task.created_at,
-            rounds_participated: task.rounds_participated, total_contribution: task.total_contribution,
+            task_id: task.task_id,
+            client_id: task.client_id,
+            task_type: task.task_type,
+            description: task.description,
+            status: task.status,
+            created_at: 0,
+            updated_at: 0,
+            rounds_participated: task.rounds_participated,
+            total_contribution: task.total_contribution as f32,
+            config: serde_json::from_str(&task.config_json).unwrap_or_default(),
         }))
     }
 }
+
+// ============================================================
+// ContributionService — contribution tracking & audit
+// ============================================================
 
 #[tonic::async_trait]
 impl ContributionService for EmbodiedFlService {
-    async fn get_contributions(&self, req: Request<ContributionRequest>) -> Result<Response<ContributionResponse>, Status> {
+    async fn get_contributions(
+        &self,
+        req: Request<ContributionQuery>,
+    ) -> Result<Response<ContributionResponse>, Status> {
         let r = req.into_inner();
-        let records = self.contribution.get_by_client(&r.client_id, r.limit.unwrap_or(20))
+        let limit = if r.limit > 0 { r.limit } else { 10 };
+
+        let records = self.contribution
+            .client_history(&r.client_id, limit)
             .map_err(|e| Status::internal(e.to_string()))?;
+
+        let total_score: f32 = records.iter()
+            .map(|r| r.contribution_score as f32)
+            .sum();
+
+        let entries: Vec<ContributionEntry> = records
+            .into_iter()
+            .map(|r| ContributionEntry {
+                client_id: r.client_id,
+                round_id: r.round_id,
+                score: r.contribution_score as f32,
+                num_samples: r.num_samples,
+                loss_improvement: r.loss_improvement as f32,
+                timestamp: r.timestamp,
+                audit_hash: String::new(),
+            })
+            .collect();
+
         Ok(Response::new(ContributionResponse {
-            records: records.into_iter().map(|c| ContributionRecordMsg {
-                id: c.id, client_id: c.client_id, round_id: c.round_id, task_type: c.task_type,
-                num_samples: c.num_samples, loss_before: c.loss_before, loss_after: c.loss_after,
-                loss_improvement: c.loss_improvement, contribution_score: c.contribution_score,
-                timestamp: c.timestamp,
-            }).collect(),
+            entries,
+            total_score,
         }))
     }
 
-    async fn get_leaderboard(&self, req: Request<LeaderboardRequest>) -> Result<Response<LeaderboardResponse>, Status> {
+    async fn get_leaderboard(
+        &self,
+        req: Request<LeaderboardRequest>,
+    ) -> Result<Response<LeaderboardResponse>, Status> {
         let r = req.into_inner();
-        let entries = self.contribution.leaderboard(r.top_k.unwrap_or(10), r.task_type.as_deref())
+        let top_k = if r.top_k > 0 { r.top_k } else { 10 };
+        let task_type = if r.task_type.is_empty() { None } else { Some(&r.task_type[..]) };
+
+        let entries = self.contribution
+            .leaderboard(top_k, task_type)
             .map_err(|e| Status::internal(e.to_string()))?;
+
         Ok(Response::new(LeaderboardResponse {
-            entries: entries.into_iter().map(|(cid, cname, score, rounds)| LeaderboardEntry {
-                client_id: cid, client_name: cname, total_contribution: score,
-                rounds_participated: rounds, total_samples: 0, avg_loss_improvement: 0.0,
-            }).collect(),
+            entries: entries
+                .into_iter()
+                .map(|s| LeaderboardEntry {
+                    client_id: s.client_id,
+                    client_name: s.client_name,
+                    total_contribution: s.total_contribution as f32,
+                    rounds_participated: s.rounds_participated,
+                    total_samples: s.total_samples,
+                    avg_loss_improvement: s.avg_loss_improvement as f32,
+                })
+                .collect(),
         }))
     }
 
-    async fn verify(&self, _req: Request<VerifyRequest>) -> Result<Response<VerifyResponse>, Status> {
-        let (valid, length, hash) = self.audit.verify_chain()
+    async fn verify_audit_chain(
+        &self,
+        _req: Request<VerifyRequest>,
+    ) -> Result<Response<VerifyResponse>, Status> {
+        let (valid, length, hash) = self.audit
+            .verify_chain()
             .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(VerifyResponse { valid, chain_length: length, latest_hash: hash }))
+
+        Ok(Response::new(VerifyResponse {
+            valid,
+            chain_length: length,
+            latest_hash: hash,
+        }))
     }
 }

@@ -1,16 +1,15 @@
-# ── src/vla_service.rs ──
-"""
-VLA Data Service — gRPC implementation for Vision-Language-Action data management.
-
-Handles episode upload, query, and dataset statistics for VLA federated training.
-Episodes are stored in SQLite alongside task registry, with instruction embeddings
-indexed in HNSW for task matching.
-
-Bridge to Python:
-  Python VLAFLTrainer → gRPC UploadEpisode → Rust stores + indexes
-  Rust VLADataService → gRPC QueryEpisodes → Python VLADataset.from_server()
-"""
-
+//! - src/vla_service.rs -
+//!
+//! VLA Data Service — gRPC implementation for Vision-Language-Action data management.
+//!
+//! Handles episode upload, query, and dataset statistics for VLA federated training.
+//! Episodes are stored in SQLite alongside task registry, with instruction embeddings
+//! indexed in HNSW for task matching.
+//!
+//! Bridge to Python:
+//!   Python VLAFLTrainer → gRPC UploadEpisode → Rust stores + indexes
+//!   Rust VLADataService → gRPC QueryEpisodes → Python VLADataset.from_server()
+//!
 use std::sync::Arc;
 use std::collections::HashMap;
 use anyhow::Result;
@@ -168,7 +167,7 @@ impl VLAEpisodeStore {
 
         let successful: i32 = conn.query_row(
             &format!("SELECT COUNT(*) FROM vla_episodes {} AND is_success = 1",
-                     if filter.is_empty() { "WHERE".into() } else { "AND".into() }),
+                     if filter.is_empty() { "WHERE" } else { "AND" }),
             [],
             |r| r.get(0),
         ).unwrap_or(0);
@@ -315,9 +314,9 @@ impl VLADataService {
         }
 
         // Audit
-        self.audit.append("vla_episode_upload", &format!(
-            "episode={} client={} task={} steps={} reward={:.4} success={}",
-            episode_id, client_id, task_type, num_steps, avg_reward, is_success,
+        self.audit.append("vla_episode_upload", client_id, &format!(
+            "episode={} task={} steps={} reward={:.4} success={}",
+            episode_id, task_type, num_steps, avg_reward, is_success,
         ))?;
 
         info!(

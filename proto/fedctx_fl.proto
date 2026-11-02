@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package fedctx;
+
+// FedCtx FederatedLearning service — mirrored from unified-fl-backend
+// for cross-repo gRPC client use.
+
+message ModelUpdateProto {
+  string client_id = 1;
+  uint32 round = 2;
+  repeated float parameters = 3;
+  int64 num_samples = 4;
+  float train_loss = 5;
+  double entropy = 6;
+}
+
+message SubmitUpdateRequest {
+  ModelUpdateProto update = 1;
+}
+
+message SubmitUpdateResponse {
+  bool accepted = 1;
+  uint32 current_round = 2;
+  int32 updates_received = 3;
+}
+
+message AggregateRequest {}
+
+message AggregateResponse {
+  bool success = 1;
+  uint32 round = 2;
+  int32 num_clients = 3;
+  string strategy = 4;
+}
+
+message GetModelRequest {}
+
+message GetModelResponse {
+  repeated float parameters = 1;
+  uint32 round = 2;
+  int32 num_clients = 3;
+  string strategy = 4;
+}
+
+message ListRoundsRequest {
+  int32 limit = 1;
+}
+
+message FlRoundState {
+  uint32 round = 1;
+  int32 num_updates = 2;
+  string status = 3;
+  repeated string client_ids = 4;
+}
+
+message ListRoundsResponse {
+  repeated FlRoundState rounds = 1;
+}
+
+service FederatedLearning {
+  rpc SubmitUpdate(SubmitUpdateRequest) returns (SubmitUpdateResponse);
+  rpc Aggregate(AggregateRequest) returns (AggregateResponse);
+  rpc GetModel(GetModelRequest) returns (GetModelResponse);
+  rpc ListRounds(ListRoundsRequest) returns (ListRoundsResponse);
+}
