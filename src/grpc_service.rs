@@ -188,20 +188,7 @@ impl FederatedService for EmbodiedFlService {
             r.client_id, r.num_local_samples, r.local_loss
         );
 
-        // Record update in local round state
-        self.fed_server
-            .record_update(
-                &r.client_id,
-                self.fed_server.current_round_num() as i64,
-                "",
-                r.num_local_samples,
-                r.local_loss as f64,
-                r.local_accuracy,
-                &r.local_weights,
-            )
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        // P2P: Submit to local FedAvg engine (no central coordinator)
+        // P2P: Submit update to local FedAvg engine (single source of truth)
         let local_result = self.fed_server
             .submit_update_local(
                 &r.client_id,
@@ -300,7 +287,7 @@ impl FederatedService for EmbodiedFlService {
         info!("Trigger aggregation: requester={} strategy={}", r.requester_id, r.strategy);
 
         // P2P: Local FedAvg aggregation (no central coordinator)
-        match self.fed_server.trigger_aggregation_local().await {
+        match self.fed_server.trigger_aggregation_local(&self.audit).await {
             Ok(result) => {
                 info!("Local FedAvg succeeded: round={} clients={}", result.round, result.num_clients);
                 self.audit
