@@ -10,5 +10,7 @@ pub mod web_dashboard;
 pub mod task_embedding;
 pub mod vla_service;
 pub mod fedctx_client;
+pub mod peer_manager;
+pub mod p2p_network;
 pub mod auth;
 pub mod tls;

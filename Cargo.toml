@@ -1,12 +1,12 @@
 [package]
 name = "embodied-fl"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2021"
-description = "Federated Learning Platform for Embodied Intelligence — distributed robot training with data privacy"
+description = "P2P Federated Learning Platform — plug and play, no central coordinator"
 license = "Apache-2.0"
 readme = "README.md"
-keywords = ["federated-learning", "embodied-ai", "robotics", "rust", "tls"]
-categories = ["science", "simulation"]
+keywords = ["federated-learning", "p2p", "libp2p", "rust", "plug-and-play"]
+categories = ["science", "network-programming"]
 repository = "https://github.com/dechang64/embodied-fl"
 
 [dependencies]
@@ -14,6 +14,9 @@ repository = "https://github.com/dechang64/embodied-fl"
 tonic = { version = "0.13", features = ["tls-native-roots", "transport"] }
 prost = "0.13"
 tokio = { version = "1", features = ["full"] }
+
+# P2P networking (libp2p)
+libp2p = { version = "0.54", features = ["tcp", "noise", "yamux", "mdns", "gossipsub", "identify", "ping", "macros", "tokio"] }
 
 # Web
 axum = { version = "0.8", features = ["macros"] }

@@ -1,12 +1,14 @@
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::info;
+use tokio::sync::mpsc;
 
 use crate::task_registry::TaskRegistry;
 use crate::fed_server::FedServer;
 use crate::contribution_tracker::ContributionTracker;
 use crate::vector_db::VectorDb;
 use crate::audit::AuditChain;
+use crate::p2p_network::{P2pCommand, ModelUpdateMessage, GlobalModelMessage};
 
 pub mod proto {
     tonic::include_proto!("embodiedfl");
@@ -22,7 +24,7 @@ use proto::{
 /// Embodied-FL gRPC service — P2P federated learning.
 ///
 /// Each node handles its own FedAvg aggregation locally.
-/// No central coordinator — all nodes are equal peers.
+/// Model updates are gossiped to peers via libp2p gossipsub.
 #[derive(Clone)]
 pub struct EmbodiedFlService {
     task_registry: Arc<TaskRegistry>,
@@ -30,6 +32,7 @@ pub struct EmbodiedFlService {
     contribution: Arc<ContributionTracker>,
     vector_db: Arc<std::sync::RwLock<VectorDb>>,
     audit: Arc<AuditChain>,
+    p2p_cmd_tx: Option<mpsc::UnboundedSender<P2pCommand>>,
 }
 
 impl EmbodiedFlService {
@@ -39,6 +42,7 @@ impl EmbodiedFlService {
         contribution: Arc<ContributionTracker>,
         vector_db: Arc<std::sync::RwLock<VectorDb>>,
         audit: Arc<AuditChain>,
+        p2p_cmd_tx: Option<mpsc::UnboundedSender<P2pCommand>>,
     ) -> Self {
         Self {
             task_registry,
@@ -46,6 +50,7 @@ impl EmbodiedFlService {
             contribution,
             vector_db,
             audit,
+            p2p_cmd_tx,
         }
     }
 
@@ -203,6 +208,22 @@ impl FederatedService for EmbodiedFlService {
             tracing::warn!("Local FedAvg submit failed (non-fatal): {}", e);
         }
 
+        // P2P: Broadcast update to all peers via gossipsub
+        if let Some(tx) = &self.p2p_cmd_tx {
+            let params: Vec<f32> = r.local_weights
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap_or([0; 4])))
+                .collect();
+            let msg = ModelUpdateMessage {
+                client_id: r.client_id.clone(),
+                round: self.fed_server.current_round_num() as u32,
+                num_samples: r.num_local_samples as i64,
+                train_loss: r.local_loss as f32,
+                params,
+            };
+            let _ = tx.send(P2pCommand::BroadcastUpdate(msg));
+        }
+
         // Record contribution
         let loss_improvement = 0.0_f64; // Computed after local aggregation
         let score = ContributionTracker::calculate_score(
@@ -293,6 +314,18 @@ impl FederatedService for EmbodiedFlService {
                 self.audit
                     .append("aggregation", "local", &format!("round={} clients={} strategy={}", result.round, result.num_clients, result.strategy))
                     .map_err(|e| Status::internal(e.to_string()))?;
+
+                // P2P: Broadcast new global model to all peers
+                if let Some(tx) = &self.p2p_cmd_tx {
+                    let params = self.fed_server.get_global_params();
+                    let msg = GlobalModelMessage {
+                        round: result.round,
+                        params,
+                        num_clients: result.num_clients,
+                        source: "local".to_string(),
+                    };
+                    let _ = tx.send(P2pCommand::BroadcastModel(msg));
+                }
 
                 Ok(Response::new(AggregationResponse {
                     triggered: true,
