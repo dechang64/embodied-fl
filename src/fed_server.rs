@@ -1,15 +1,12 @@
-//! Federated Server — delegates aggregation to FedCtx coordinator.
+//! Federated Server — P2P local aggregation (no central coordinator).
 //!
-//! Phase 1 fix: This module now forwards model updates and aggregation
-//! requests to FedCtx (unified-fl-backend) via gRPC, instead of only
-//! averaging loss/accuracy locally.
+//! Each node performs FedAvg locally on received updates.
+//! Model updates are gossiped to peers via PeerManager.
 //!
-//! Architecture:
-//!   Client -> embodied-fl gRPC -> fedctx_client -> FedCtx FlEngine (real FedAvg)
-//!
-//! The local FedServer still maintains round state, contribution tracking,
-//! and audit chain for node-side operations, but parameter aggregation
-//! is delegated to FedCtx.
+//! Architecture (P2P):
+//!   Node A ←→ Node B ←→ Node C
+//!   Each node: gRPC server + peer clients + local FedAvg engine
+//!   No master/slave — all nodes are equal.
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -21,7 +18,6 @@ use sha2::Digest;
 use crate::task_registry::TaskRegistry;
 use crate::task_embedding::{TaskEmbedding, TaskMatcher};
 use crate::audit::AuditChain;
-use crate::fedctx_client::{FedCtxClient, SubmitUpdateResult, AggregateResult};
 
 /// Aggregation strategy for multi-task FL.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -107,8 +103,10 @@ pub struct FedServer {
     strategy: Mutex<AggregationStrategy>,
     round_counter: Mutex<i32>,
     registered_clients: Mutex<HashMap<String, ClientInfo>>,
-    /// Phase 1: FedCtx client for real parameter aggregation.
-    fedctx: Option<Arc<FedCtxClient>>,
+    /// P2P: Global model parameters (f32 vector), maintained locally via FedAvg.
+    global_params: Mutex<Vec<f32>>,
+    /// P2P: All received updates (for local FedAvg).
+    pending_updates: Mutex<Vec<ClientUpdate>>,
 }
 
 /// Registered client info.
@@ -120,12 +118,28 @@ pub struct ClientInfo {
     pub registered_at: String,
 }
 
+/// Result of submitting an update for aggregation.
+#[derive(Debug, Clone)]
+pub struct SubmitUpdateResult {
+    pub accepted: bool,
+    pub current_round: u32,
+    pub updates_received: i32,
+}
+
+/// Result of triggering aggregation.
+#[derive(Debug, Clone)]
+pub struct AggregateResult {
+    pub success: bool,
+    pub round: u32,
+    pub num_clients: i32,
+    pub strategy: String,
+}
+
 impl FedServer {
     pub fn new(
         task_registry: Arc<TaskRegistry>,
         audit: Arc<AuditChain>,
         task_matcher_registry: Arc<TaskRegistry>,
-        fedctx: Option<Arc<FedCtxClient>>,
     ) -> Self {
         let task_matcher = TaskMatcher::new(TaskEmbedding::new(32));
 
@@ -136,7 +150,8 @@ impl FedServer {
             strategy: Mutex::new(AggregationStrategy::default()),
             round_counter: Mutex::new(0),
             registered_clients: Mutex::new(HashMap::new()),
-            fedctx,
+            global_params: Mutex::new(Vec::new()),
+            pending_updates: Mutex::new(Vec::new()),
         }
     }
 
@@ -441,14 +456,13 @@ impl FedServer {
     }
 
     // ════════════════════════════════════════════════════════════════
-    // Phase 1: FedCtx delegation methods
+    // P2P: Local FedAvg aggregation (no central coordinator)
     // ════════════════════════════════════════════════════════════════
 
-    /// Phase 1: Submit update to FedCtx for real parameter aggregation.
+    /// P2P: Submit update for local FedAvg aggregation.
     ///
-    /// Converts the raw weight bytes to Vec<f32> and sends to FedCtx's
-    /// SubmitUpdate RPC, which performs real FedAvg.
-    pub async fn submit_update_to_fedctx(
+    /// Stores the update and performs weighted average of parameters.
+    pub async fn submit_update_local(
         &self,
         client_id: &str,
         round: u32,
@@ -456,11 +470,6 @@ impl FedServer {
         num_samples: i64,
         train_loss: f32,
     ) -> Result<SubmitUpdateResult> {
-        let fedctx = self
-            .fedctx
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("FedCtx client not available"))?;
-
         // Convert bytes to f32 array
         let parameters: Vec<f32> = weight_bytes
             .chunks_exact(4)
@@ -470,40 +479,119 @@ impl FedServer {
             })
             .collect();
 
-        fedctx
-            .submit_update(client_id, round, parameters, num_samples, train_loss)
-            .await
+        // Store as pending update
+        let update = ClientUpdate {
+            client_id: client_id.to_string(),
+            task_id: String::new(),
+            round_num: round as i32,
+            num_samples: num_samples as i32,
+            local_loss: train_loss as f64,
+            local_accuracy: 0.0,
+            gradient_norm: 0.0,
+            compression_ratio: 1.0,
+            task_type: String::new(),
+            model_heads: vec![],
+            params_b64: base64::engine::general_purpose::STANDARD.encode(weight_bytes),
+            params_hash: hex::encode(&sha2::Sha256::digest(weight_bytes).to_vec()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+
+        self.pending_updates.lock().unwrap().push(update);
+
+        let count = self.pending_updates.lock().unwrap().len() as i32;
+
+        Ok(SubmitUpdateResult {
+            accepted: true,
+            current_round: round,
+            updates_received: count,
+        })
     }
 
-    /// Phase 1: Trigger aggregation on FedCtx (real FedAvg).
-    pub async fn trigger_aggregation_on_fedctx(&self) -> Result<AggregateResult> {
-        let fedctx = self
-            .fedctx
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("FedCtx client not available"))?;
+    /// P2P: Trigger local FedAvg aggregation on all pending updates.
+    pub async fn trigger_aggregation_local(&self) -> Result<AggregateResult> {
+        let mut pending = self.pending_updates.lock().unwrap();
+        if pending.is_empty() {
+            anyhow::bail!("No pending updates to aggregate");
+        }
 
-        fedctx.aggregate().await
-    }
+        let n = pending.len() as f32;
+        let mut agg_params: Vec<f32> = Vec::new();
 
-    /// Phase 1: Get global model parameters as bytes from FedCtx.
-    pub async fn get_global_model_bytes(&self) -> Result<Vec<u8>> {
-        if let Some(ref fedctx) = self.fedctx {
-            match fedctx.get_model().await {
-                Ok(model) => {
-                    // Convert Vec<f32> to Vec<u8>
-                    let mut bytes = Vec::with_capacity(model.parameters.len() * 4);
-                    for p in &model.parameters {
-                        bytes.extend_from_slice(&p.to_le_bytes());
-                    }
-                    return Ok(bytes);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to get model bytes from FedCtx: {}", e);
+        // FedAvg: weighted average by num_samples
+        let total_samples: i32 = pending.iter().map(|u| u.num_samples).sum();
+        let total_samples = total_samples.max(1) as f32;
+
+        // Determine max param length
+        let max_len = pending
+            .iter()
+            .map(|u| {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&u.params_b64)
+                    .unwrap_or_default();
+                bytes.len() / 4
+            })
+            .max()
+            .unwrap_or(0);
+
+        agg_params.resize(max_len, 0.0f32);
+
+        for u in pending.iter() {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&u.params_b64)
+                .unwrap_or_default();
+            let params: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap_or([0; 4])))
+                .collect();
+            let weight = u.num_samples as f32 / total_samples;
+            for (i, &p) in params.iter().enumerate() {
+                if i < agg_params.len() {
+                    agg_params[i] += p * weight;
                 }
             }
         }
-        // Local fallback: return empty
-        Ok(Vec::new())
+
+        // Store aggregated parameters
+        *self.global_params.lock().unwrap() = agg_params.clone();
+
+        let round = self.round_counter.lock().unwrap().clone() as u32;
+
+        // Clear pending updates
+        pending.clear();
+
+        info!(
+            "Local FedAvg completed: round={}, params_len={}, participants={}",
+            round,
+            agg_params.len(),
+            n as i32
+        );
+
+        Ok(AggregateResult {
+            success: true,
+            round,
+            num_clients: n as i32,
+            strategy: "FedAvg".to_string(),
+        })
+    }
+
+    /// P2P: Get global model parameters as bytes.
+    pub async fn get_global_model_bytes(&self) -> Result<Vec<u8>> {
+        let params = self.global_params.lock().unwrap();
+        let mut bytes = Vec::with_capacity(params.len() * 4);
+        for p in params.iter() {
+            bytes.extend_from_slice(&p.to_le_bytes());
+        }
+        Ok(bytes)
+    }
+
+    /// P2P: Get global model parameters as f32 vector.
+    pub fn get_global_params(&self) -> Vec<f32> {
+        self.global_params.lock().unwrap().clone()
+    }
+
+    /// P2P: Set global model parameters (from peer's aggregated model).
+    pub fn set_global_params(&self, params: Vec<f32>) {
+        *self.global_params.lock().unwrap() = params;
     }
 
     /// List registered clients.

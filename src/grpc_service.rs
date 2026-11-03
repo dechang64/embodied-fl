@@ -19,10 +19,10 @@ use proto::{
     *,
 };
 
-/// Embodied-FL gRPC service — implements all three service traits.
+/// Embodied-FL gRPC service — P2P federated learning.
 ///
-/// Phase 1 fix: FederatedService now forwards updates to FedCtx for real
-/// parameter aggregation, and returns actual model weights via GetGlobalModel.
+/// Each node handles its own FedAvg aggregation locally.
+/// No central coordinator — all nodes are equal peers.
 #[derive(Clone)]
 pub struct EmbodiedFlService {
     task_registry: Arc<TaskRegistry>,
@@ -161,7 +161,7 @@ impl FederatedService for EmbodiedFlService {
         let r = req.into_inner();
         info!("Get global model: client={} type={}", r.client_id, r.model_type);
 
-        // Phase 1: Get real model bytes from FedCtx
+        // P2P: Get model bytes from local FedAvg engine
         let model_bytes = self.fed_server.get_global_model_bytes().await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -201,9 +201,9 @@ impl FederatedService for EmbodiedFlService {
             )
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        // Phase 1: Forward to FedCtx for real aggregation
-        let fedctx_result = self.fed_server
-            .submit_update_to_fedctx(
+        // P2P: Submit to local FedAvg engine (no central coordinator)
+        let local_result = self.fed_server
+            .submit_update_local(
                 &r.client_id,
                 self.fed_server.current_round_num() as u32,
                 &r.local_weights,
@@ -212,12 +212,12 @@ impl FederatedService for EmbodiedFlService {
             )
             .await;
 
-        if let Err(e) = &fedctx_result {
-            tracing::warn!("FedCtx submit failed (non-fatal): {}", e);
+        if let Err(e) = &local_result {
+            tracing::warn!("Local FedAvg submit failed (non-fatal): {}", e);
         }
 
         // Record contribution
-        let loss_improvement = 0.0_f64; // Computed by FedCtx after aggregation
+        let loss_improvement = 0.0_f64; // Computed after local aggregation
         let score = ContributionTracker::calculate_score(
             r.num_local_samples,
             loss_improvement,
@@ -299,39 +299,25 @@ impl FederatedService for EmbodiedFlService {
         let r = req.into_inner();
         info!("Trigger aggregation: requester={} strategy={}", r.requester_id, r.strategy);
 
-        // Phase 1: Try FedCtx aggregation first
-        let fedctx_result = self.fed_server.trigger_aggregation_on_fedctx().await;
-
-        match fedctx_result {
+        // P2P: Local FedAvg aggregation (no central coordinator)
+        match self.fed_server.trigger_aggregation_local().await {
             Ok(result) => {
-                info!("FedCtx aggregation succeeded: round={} clients={}", result.round, result.num_clients);
+                info!("Local FedAvg succeeded: round={} clients={}", result.round, result.num_clients);
                 self.audit
-                    .append("aggregation", "server", &format!("fedctx round={} clients={}", result.round, result.num_clients))
+                    .append("aggregation", "local", &format!("round={} clients={} strategy={}", result.round, result.num_clients, result.strategy))
                     .map_err(|e| Status::internal(e.to_string()))?;
 
                 Ok(Response::new(AggregationResponse {
                     triggered: true,
                     new_round_id: result.round as i64,
-                    new_model_version: format!("fedctx_r{}", result.round),
+                    new_model_version: format!("p2p_r{}", result.round),
                     num_updates_aggregated: result.num_clients,
                     new_global_loss: 0.0,
                 }))
             }
             Err(e) => {
-                tracing::warn!("FedCtx aggregation failed, falling back to local: {}", e);
-
-                // Fallback: local aggregation
-                let result = self.fed_server
-                    .aggregate(&self.audit)
-                    .map_err(|e| Status::internal(e.to_string()))?;
-
-                Ok(Response::new(AggregationResponse {
-                    triggered: true,
-                    new_round_id: result.round_num as i64,
-                    new_model_version: format!("local_r{}", result.round_num),
-                    num_updates_aggregated: result.num_participants as i32,
-                    new_global_loss: result.global_loss as f32,
-                }))
+                info!("Local FedAvg failed ({}), no updates to aggregate", e);
+                Err(Status::internal(e.to_string()))
             }
         }
     }

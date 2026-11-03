@@ -14,6 +14,7 @@ mod web_dashboard;
 mod task_embedding;
 mod vla_service;
 mod fedctx_client;
+mod peer_manager;
 mod auth;
 mod tls;
 
@@ -24,14 +25,14 @@ use vector_db::VectorDb;
 use audit::AuditChain;
 use grpc_service::EmbodiedFlService;
 use rest_api::ApiState;
-use fedctx_client::{FedCtxClient, FedCtxConfig};
 use auth::DeviceIdentity;
 use tls::ServerTlsConfig;
+use peer_manager::PeerManager;
 
 #[derive(Parser)]
 #[command(name = "embodied-fl")]
-#[command(version = "0.2.0")]
-#[command(about = "Embodied-FL — Federated Learning for Embodied Intelligence")]
+#[command(version = "0.3.0")]
+#[command(about = "Embodied-FL — P2P Federated Learning for Embodied Intelligence")]
 struct Cli {
     /// gRPC listen port
     #[arg(long, default_value = "50051")]
@@ -41,9 +42,10 @@ struct Cli {
     #[arg(long, default_value = "8080")]
     rest_port: u16,
 
-    /// FedCtx coordinator endpoint
-    #[arg(long, default_value = "http://127.0.0.1:50052")]
-    fedctx_endpoint: String,
+    /// P2P peer endpoints (comma-separated)
+    /// e.g. --peers http://10.7.44.50:50051,http://10.14.64.127:50051
+    #[arg(long, env = "EMBODIED_FL_PEERS")]
+    peers: Option<String>,
 
     /// API key for authentication
     #[arg(long, env = "EMBODIED_FL_API_KEY", default_value = "dev-key")]
@@ -87,14 +89,14 @@ async fn main() -> anyhow::Result<()> {
 
     info!("");
     info!("╔══════════════════════════════════════════════════╗");
-    info!("║   Embodied-FL v0.2.0                            ║");
-    info!("║   Federated Learning for Embodied Intelligence   ║");
-    info!("║   Phase 1: FedCtx delegation                    ║");
-    info!("║   Phase 2: mTLS + Ed25519 + API Key             ║");
+    info!("║   Embodied-FL v0.3.0                            ║");
+    info!("║   P2P Federated Learning                        ║");
+    info!("║   No master/slave — all nodes are equal         ║");
+    info!("║   mTLS + Ed25519 + API Key + Gossip             ║");
     info!("╚══════════════════════════════════════════════════╝");
     info!("");
 
-    // - Phase 2: Device Identity (Ed25519) -
+    // - Device Identity (Ed25519) -
     let device_identity = if let Some(ref path) = cli.device_identity_file {
         let path = std::path::Path::new(path);
         auth::load_or_generate_identity(&cli.device_id, Some(path))?
@@ -102,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
         DeviceIdentity::generate(&cli.device_id)
     };
 
-    // - Phase 2: TLS Configuration -
+    // - TLS Configuration -
     let tls_config = if cli.gen_tls {
         let cert_dir = std::path::Path::new("./tls-certs");
         tls::generate_dev_certificates(cert_dir)?;
@@ -111,36 +113,29 @@ async fn main() -> anyhow::Result<()> {
             cert_dir.join("server.pem"),
             cert_dir.join("server-key.pem"),
         )
-    } else if let (Some(ca), Some(cert), Some(key)) = (&cli.tls_ca, &cli.tls_cert, &cli.tls_key) {
+    } else if let (Some(ca), Some(cert), Some(key)) = (
+        &cli.tls_ca, &cli.tls_cert, &cli.tls_key
+    ) {
         ServerTlsConfig::mtls(ca, cert, key)
     } else {
         ServerTlsConfig::plaintext()
     };
 
-    // - Phase 1: Connect to FedCtx coordinator -
-    let fedctx_config = FedCtxConfig {
-        endpoint: cli.fedctx_endpoint.clone(),
-        tls_ca_cert: cli.tls_ca.clone(),
-        tls_client_cert: cli.tls_cert.clone(),
-        tls_client_key: cli.tls_key.clone(),
-        api_key: Some(cli.api_key.clone()),
-    };
+    // - P2P Peer Manager -
+    let peer_manager = Arc::new(PeerManager::new(&cli.device_id));
 
-    let fedctx_client = match FedCtxClient::connect(fedctx_config).await {
-        Ok(client) => {
-            info!("✅ Connected to FedCtx at {}", cli.fedctx_endpoint);
-            if client.health_check().await {
-                info!("✅ FedCtx health check passed");
-            } else {
-                info!("⚠️  FedCtx health check failed — will retry on demand");
+    // Parse peers from comma-separated list
+    if let Some(ref peers_str) = cli.peers {
+        for endpoint in peers_str.split(',') {
+            let endpoint = endpoint.trim();
+            if !endpoint.is_empty() {
+                peer_manager.add_peer(endpoint);
+                info!("📡 Peer added: {}", endpoint);
             }
-            Some(client)
         }
-        Err(e) => {
-            info!("⚠️  FedCtx not available ({}), running in standalone mode", e);
-            None
-        }
-    };
+    }
+
+    let num_peers = peer_manager.list_peers().len();
 
     // - Initialize local components -
     std::fs::create_dir_all("data")?;
@@ -155,10 +150,8 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&task_registry),
         Arc::clone(&audit),
         Arc::clone(&task_registry),
-        fedctx_client.clone(),
     ));
-    info!("FedServer initialized (FedCtx delegation: {})",
-          if fedctx_client.is_some() { "ACTIVE" } else { "STANDALONE" });
+    info!("FedServer initialized (P2P local FedAvg)");
 
     let contribution = Arc::new(ContributionTracker::new(std::path::Path::new("data/contributions.db"))?);
     info!("ContributionTracker initialized");
@@ -215,15 +208,14 @@ async fn main() -> anyhow::Result<()> {
           device_identity.device_id(),
           device_identity.public_key_hex());
     info!("");
-    info!("Phase 1: FedCtx delegation = {}",
-          if fedctx_client.is_some() { "ACTIVE" } else { "STANDALONE" });
-    info!("Phase 2: mTLS = {}, Ed25519 = ACTIVE, API Key = ACTIVE",
+    info!("P2P mode: {} peer(s) configured", num_peers);
+    info!("mTLS = {}, Ed25519 = ACTIVE, API Key = ACTIVE",
           if tls_config.is_tls() { "ACTIVE" } else { "DISABLED" });
     info!("");
     info!("Quick start:");
-    info!("  1. Start FedCtx:  cargo run --bin fedctx -- --grpc-port 50052");
-    info!("  2. Start node:    cargo run -- --fedctx-endpoint http://127.0.0.1:50052");
-    info!("  3. Open dashboard: http://localhost:{}", cli.rest_port);
+    info!("  1. Start this node:  embodied-fl --peers http://<peer-ip>:50051");
+    info!("  2. On peer node:    embodied-fl --peers http://<this-ip>:50051");
+    info!("  3. Open dashboard:   http://localhost:{}", cli.rest_port);
 
     tokio::select! {
         r = grpc_server => { r?; }
