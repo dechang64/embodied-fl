@@ -1,3 +1,4 @@
+from __future__ import annotations
 # ── python/analysis/multi_task_fl.py ──
 """
 Multi-Task Federated Learning Engine for Embodied Intelligence
